@@ -1,6 +1,7 @@
 import math
 import mmcv
 import torch
+import torch.nn.functional as F
 from torch import nn as nn
 from mmdet.models import weighted_loss
 from mmdet.models.builder import LOSSES
@@ -445,3 +446,203 @@ def plan_map_dir_loss(pred, target, dis_thresh=2.0):
     loss = torch.abs(yaw_diff)
 
     return loss  # [B, fut_ts]
+
+MAPPED_NAME = [
+    'car',
+    'truck', 
+    'construction_vehicle', # 忽略
+    'bus',
+    'trailer', 
+    'barrier', # 忽略
+    'motorcycle', # 忽略
+    'bicycle', # 忽略
+    'pedestrian', 
+    'traffic_cone' # 忽略
+]
+# 他车的质量相对于自车的倍数
+MASS = {
+    'barrier': 2.5,
+    'bicycle': 0.5,
+    'bus': 2.0,
+    'car': 1.0,
+    'construction_vehicle': 1.0,
+    'motorcycle': 1.0,
+    'pedestrian': 0.5,
+    'traffic_cone': 0.0,
+    'trailer': 2.5,
+    'truck': 2.5
+}
+# 他车的危险系数
+Risk_K = {
+    'barrier': 2.5,
+    'bicycle': 0.5,
+    'bus': 2.0,
+    'car': 1.0,
+    'construction_vehicle': 1.0,
+    'motorcycle': 1.0,
+    'pedestrian': 0.5,
+    'traffic_cone': 0.0,
+    'trailer': 2.5,
+    'truck': 2.5
+}
+# 环境因素
+Risk_C = 1.0
+# 横向衰减系数
+Risk_beta = 0.5
+
+
+@LOSSES.register_module()
+class PlanRiskLoss(nn.Module):
+    """Planning constraint to push ego vehicle away from other agents.
+
+    Args:
+        reduction (str, optional): The method to reduce the loss.
+            Options are "none", "mean" and "sum".
+        loss_weight (float, optional): The weight of loss.
+        agent_thresh (float, optional): confidence threshold to filter agent predictions.
+        x_dis_thresh (float, optional): distance threshold between ego and other agents in x-axis.
+        y_dis_thresh (float, optional): distance threshold between ego and other agents in y-axis.
+        point_cloud_range (list, optional): point cloud range.
+    """
+
+    def __init__(
+        self,
+        reduction='mean',
+        loss_weight=1.0,
+        agent_thresh=0.5,
+        x_dis_thresh=1.5,
+        y_dis_thresh=3.0,
+        point_cloud_range = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]
+    ):
+        super(PlanRiskLoss, self).__init__()
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.agent_thresh = agent_thresh
+        self.x_dis_thresh = x_dis_thresh
+        self.y_dis_thresh = y_dis_thresh
+        self.pc_range = point_cloud_range
+
+    def forward(self,
+                ego_fut_preds,
+                agent_preds,
+                agent_fut_preds,
+                agent_score_preds,
+                agent_fut_cls_preds,
+                ego_risk_ref,
+                reduction_override=None,
+                ):
+        """Forward function.
+
+        Args:
+            ego_fut_preds (Tensor): [B, fut_ts, 2]
+            agent_preds (Tensor): [B, num_agent, 2]
+            agent_fut_preds (Tensor): [B, num_agent, fut_mode, fut_ts, 2]
+            agent_fut_cls_preds (Tensor): [B, num_agent, fut_mode]
+            agent_score_preds (Tensor): [B, num_agent, 10]
+            weight (torch.Tensor, optional): The weight of loss for each
+                prediction. Defaults to None.
+            avg_factor (int, optional): Average factor that is used to average
+                the loss. Defaults to None.
+            reduction_override (str, optional): The reduction method used to
+                override the original reduction method of the loss.
+                Defaults to None.
+        """
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (reduction_override if reduction_override else self.reduction)
+
+        # filter agent element according to confidence score
+        agent_max_score_preds, agent_max_score_idxs = agent_score_preds.max(dim=-1)
+        not_valid_agent_mask = agent_max_score_preds < self.agent_thresh
+        # filter low confidence preds
+        # agent_fut_preds[not_valid_agent_mask] = 1e6
+        # filter not vehicle preds
+        not_veh_pred_mask = agent_max_score_idxs > 4  # veh idxs are 0-4
+        # agent_fut_preds[not_veh_pred_mask] = 1e6
+
+        available_mask = ~(not_valid_agent_mask & not_veh_pred_mask)
+        # only use best mode pred
+        best_mode_idxs = torch.argmax(agent_fut_cls_preds, dim=-1).tolist()
+        batch_idxs = [[i] for i in range(agent_fut_cls_preds.shape[0])]
+        agent_num_idxs = [[i for i in range(agent_fut_cls_preds.shape[1])] for j in range(agent_fut_cls_preds.shape[0])]
+        agent_fut_preds = agent_fut_preds[batch_idxs, agent_num_idxs, best_mode_idxs]
+        agent_fut_preds = agent_fut_preds[None, available_mask]
+
+        loss_bbox = self.loss_weight * plan_risk_loss(
+            ego_fut_preds,
+            agent_preds,
+            agent_fut_preds=agent_fut_preds,
+            agent_names=agent_max_score_idxs,
+            ego_risk_ref=ego_risk_ref,
+            reduction=reduction
+        )
+        return loss_bbox
+
+    @staticmethod
+    def compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance):
+        return compute(ego_dxy, agent_dxy, agent_name, distance)
+
+
+def compute(ego_dxy, agent_dxy, agent_name, distance):
+    if isinstance(agent_name, (int, torch.Tensor)):
+        agent_name = MAPPED_NAME[agent_name]
+    m = MASS.get(agent_name, 2.0)
+    k = Risk_K.get(agent_name, 2.0)
+    c = Risk_C
+    beta = Risk_beta
+
+    v_max = 100/3.6
+    v_mean = 60/3.6
+
+    # 位移变化替代速度
+    ego_v = torch.linalg.norm(ego_dxy).clamp(-v_max, v_max)
+    agent_v = torch.linalg.norm(agent_dxy).clamp(-v_max, v_max)
+
+    with torch.no_grad():
+        # 计算运动角度
+        theta = torch.acos(torch.clamp(torch.dot(ego_dxy, agent_dxy) / (torch.linalg.norm(ego_dxy) * torch.linalg.norm(agent_dxy) + 1e-8), -1.0, 1.0))
+        # 计算系数
+        # 60 km/h，论文中没有说波速如何定义，此处用城市道路通常速度代替
+        alpha_lon = ((v_mean + ego_v * torch.cos(theta)) / (v_mean - agent_v * torch.cos(theta))).clamp(0)
+        alpha_lat = torch.exp(-beta * (torch.sin(theta) ** 2))
+
+    e = 0.5 * k * c * m * (ego_v - agent_v) ** 2 / distance
+    e = alpha_lon * alpha_lat * e
+    # return torch.log(e + 1 + 1e-6)
+    return e
+
+@mmcv.jit(derivate=True, coderize=True)
+@weighted_loss
+def plan_risk_loss(
+    ego_fut_preds,
+    agent_preds,
+    agent_fut_preds,
+    agent_names,
+    ego_risk_ref
+):
+    """Planning ego-agent collsion constraint.
+
+    Args:
+        ego_fut_preds (torch.Tensor): ego_fut_preds, [B, fut_ts, 2].
+        agent_preds (torch.Tensor): agent_preds, [B, num_agent, 2].
+        agent_fut_preds (Tensor): [B, num_agent, fut_ts, 2].
+        agent_names (Tensor): [B, num_agent]
+        ego_risk_ref (Tensor): [B, 1]
+    Returns:
+        torch.Tensor: Calculated loss [B, fut_mode, fut_ts, 2]
+    """
+    B, num_agent, fut_ts = agent_fut_preds.shape[:3]
+
+    risk_values = torch.zeros([B, num_agent, fut_ts], device=ego_fut_preds.device)
+    for i in range(B):
+        for j in range(num_agent):
+            for k in range(fut_ts):
+                ego_dxy, agent_dxy = ego_fut_preds[i, k], agent_fut_preds[i, j, k]
+                agent_pose = agent_preds[i, j]
+                agent_name = agent_names[i, j]
+                distance = torch.linalg.norm(torch.cumsum(agent_fut_preds[i, :(j+1)], axis=-2) + agent_pose - ego_dxy)
+                risk_values[i, j, k] = compute(ego_dxy, agent_dxy, agent_name, distance)
+    risk_pred = torch.sum(risk_values, dim=(1, 2), keepdims=True)
+    risk_pred = torch.log(risk_pred + 1 + 1e-6)
+    loss = F.l1_loss(risk_pred, ego_risk_ref, reduction='none').clamp(0, 100)
+    assert not torch.isnan(loss).any()
+    return loss

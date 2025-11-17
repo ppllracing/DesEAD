@@ -554,8 +554,9 @@ def visualize_sample(nusc: NuScenes,
     draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset)
 
     # Show Planning
-    drwa_plnning(fig, pred_data, sample_token, axes)
-
+    draw_plnning(fig, pred_data, sample_token, axes)
+    for data in pred_data['generalization']:
+        draw_plnning(fig, data, sample_token, axes)
     plt.savefig(osp.join(savepath, 'samples', f'bev_pred_{file_id}.png'), bbox_inches='tight', dpi=200)
     title = savepath.split('/')[-1]
     plt.title(title)
@@ -574,7 +575,7 @@ def visualize_sample(nusc: NuScenes,
     plt.xlim(*xlim)
     plt.ylim(*ylim)
     draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset)
-    drwa_plnning(fig, pred_data, sample_token, axes)
+    draw_plnning(fig, pred_data, sample_token, axes)
     plt.savefig(osp.join(savepath, 'samples', f'bev_pred_agents_{file_id}.png'), bbox_inches='tight', dpi=200)
     plt.close()
 
@@ -642,7 +643,7 @@ def draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset):
     fig.set_tight_layout(True)
     fig.canvas.draw()
 
-def drwa_plnning(fig, pred_data, sample_token, axes):
+def draw_plnning(fig, pred_data, sample_token, axes):
     # Show Planning.
     axes.plot([-0.9, -0.9], [-2, 2], color='mediumseagreen', linewidth=3, alpha=0.8)
     axes.plot([-0.9, 0.9], [2, 2], color='mediumseagreen', linewidth=3, alpha=0.8)
@@ -655,6 +656,12 @@ def drwa_plnning(fig, pred_data, sample_token, axes):
     plan_traj = plan_traj.cumsum(axis=0)
     plan_traj = np.concatenate((np.zeros((1, plan_traj.shape[1])), plan_traj), axis=0)
     plan_traj = np.stack((plan_traj[:-1], plan_traj[1:]), axis=1)
+
+    axes.text(
+        *plan_traj[-1, -1], 
+        f'{pred_data["metrics"][sample_token]["risk_value"]:.2f}/{pred_data["inputs"][sample_token]["risk_value"][0].data[0].item():.2f}'
+    )
+    # print(f'{pred_data["metrics"][sample_token]["risk_value"]:.2f}/{pred_data["inputs"][sample_token]["risk_value"][0].data[0].item():.2f}')
 
     plan_vecs = None
     for i in range(plan_traj.shape[0]):
@@ -805,7 +812,7 @@ def parse_args():
 
     return args
 
-def run(sample_token_list, results_, results_input_, out_path, video_name):
+def run(sample_token_list, results, out_path, video_name):
     fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
     video_path = osp.join(out_path, video_name)
     video = cv2.VideoWriter(video_path, fourcc, 10, (2933, 800), True)
@@ -816,18 +823,18 @@ def run(sample_token_list, results_, results_input_, out_path, video_name):
         # file_id = sample_token
         file_id = str(i)
 
-        # 保存输入数据中的description
-        description = {
-            'sample_token': sample_token,
-            'contents': results_input_[sample_token]['contents'][0].data[0][0].item(),
-            'answers': results_input_[sample_token]['answers'][0].data[0][0].item()
-        }
-        mmcv.dump(description, osp.join(out_path, 'samples', f'des_{file_id}.json'), indent=4)
+        # # 保存输入数据中的description
+        # description = {
+        #     'sample_token': sample_token,
+        #     'contents': results[sample_token]['contents'][0].data[0][0].item(),
+        #     'answers': results[sample_token]['answers'][0].data[0][0].item()
+        # }
+        # mmcv.dump(description, osp.join(out_path, 'samples', f'des_{file_id}.json'), indent=4)
 
         # 此处就会绘制BEV图
         render_sample_data(
             sample_token,
-            pred_data=results_,
+            pred_data=results,
             out_path=out_path,
             file_id=file_id
         )
@@ -855,7 +862,7 @@ def run(sample_token_list, results_, results_input_, out_path, video_name):
             elif sensor_modality == 'camera':
                 boxes = [Box(record['translation'], record['size'], Quaternion(record['rotation']),
                             name=record['detection_name'], token='predicted') for record in
-                        results_['results'][sample_token]]
+                        results['results'][sample_token]]
                 data_path, boxes_pred, camera_intrinsic = get_predicted_data(sample_data_token,
                                                                             box_vis_level=BoxVisibility.ANY,
                                                                             pred_anns=boxes)
@@ -956,7 +963,7 @@ def run(sample_token_list, results_, results_input_, out_path, video_name):
             else:
                 raise ValueError("Error: Unknown sensor modality!")
 
-        plan_cmd = np.argmax(results_['plan_results'][sample_token][1][0,0,0])
+        plan_cmd = np.argmax(results['plan_results'][sample_token][1][0,0,0])
         # cmd_list = ['Turn Right', 'Turn Left', 'Go Straight']
         # plan_cmd_str = cmd_list[plan_cmd]
         pred_img = cv2.copyMakeBorder(pred_img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, None, value = 0)
@@ -999,23 +1006,19 @@ def run(sample_token_list, results_, results_input_, out_path, video_name):
 
 if __name__ == '__main__':
     args = parse_args()
-    inference_result_path = args.result_path
-    inference_result_input_path = args.result_input_path
+    result_path = args.result_path
+    # inference_result_input_path = args.result_input_path
     out_path = args.save_path
 
-    # 获取原始结果和改变了指令的结果
-    results_origin = mmcv.load(inference_result_path)
-    results_input = mmcv.load(inference_result_input_path)
+    results = mmcv.load(result_path)
+    sample_token_list = list(results['results'].keys())
 
-    sample_token_list = list(results_origin['results'].keys())
-
-    # nusc = NuScenes(version='v1.0-mini', dataroot='data/nuscenes', verbose=True)
-    nusc = NuScenes(version='v1.0-trainval', dataroot='data/nuscenes', verbose=True)
+    nusc = NuScenes(version='v1.0-mini', dataroot='data/nuscenes', verbose=True)
+    # nusc = NuScenes(version='v1.0-trainval', dataroot='data/nuscenes', verbose=True)
 
     run(
-        sample_token_list, 
-        results_origin, 
-        results_input,
+        sample_token_list,
+        results,
         out_path, 
         'results.mp4'
     )

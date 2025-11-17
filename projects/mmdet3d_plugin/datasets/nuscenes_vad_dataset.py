@@ -1310,9 +1310,10 @@ class GenADCustomNuScenesDataset(NuScenesDataset):
             ego_fut_masks=info['gt_ego_fut_masks'],
             ego_fut_cmd=info['gt_ego_fut_cmd'],
             ego_lcf_feat=info['gt_ego_lcf_feat'],
-            contents=info['description']['contents'],
-            answers=info['description']['answers'],
-            answers_token=info['description']['answers_token']
+            # contents=info['description']['contents'],
+            # answers=info['description']['answers'],
+            # answers_token=info['description']['answers_token'],
+            risk_value=info['risk_value']
         )
         # lidar to ego transform
         lidar2ego = np.eye(4).astype(np.float32)
@@ -1461,102 +1462,119 @@ class GenADCustomNuScenesDataset(NuScenesDataset):
         Returns:
             str: Path of the output json file.
         """
-        nusc_annos = {}
-        det_mapped_class_names = self.CLASSES
+        def process(results):
+            nusc_annos = {}
+            det_mapped_class_names = self.CLASSES
 
-        # assert self.map_ann_file is not None
-        map_pred_annos = {}
-        map_mapped_class_names = self.MAPCLASSES
+            # assert self.map_ann_file is not None
+            map_pred_annos = {}
+            map_mapped_class_names = self.MAPCLASSES
 
-        plan_annos = {}
+            plan_annos = {}
+            metrics = {}
+            inputs = {}
 
-        print('Start to convert detection format...')
-        # for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
-        for sample_id, det in enumerate(results):
-            annos = []
-            boxes = output_to_nusc_box(det)
-            sample_token = self.data_infos[sample_id]['token']
+            print('Start to convert detection format...')
+            for sample_id, res in enumerate(mmcv.track_iter_progress(results)):
+            # for sample_id, det in enumerate(results):
+                pts_bbox = res['pts_bbox']
+                annos = []
+                boxes = output_to_nusc_box(pts_bbox)
+                sample_token = self.data_infos[sample_id]['token']
 
-            plan_annos[sample_token] = [det['ego_fut_preds'], det['ego_fut_cmd']]
+                plan_annos[sample_token] = [pts_bbox['ego_fut_preds'], pts_bbox['ego_fut_cmd']]
+                metrics[sample_token] = res['metric_results']
+                inputs[sample_token] = res['input']
 
-            boxes = lidar_nusc_box_to_global(self.data_infos[sample_id], boxes,
-                                             det_mapped_class_names,
-                                             self.custom_eval_detection_configs,
-                                             self.eval_version)
-            for i, box in enumerate(boxes):
-                if box.score < score_thresh:
-                    continue
-                name = det_mapped_class_names[box.label]
-                if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
-                    if name in [
-                            'car',
-                            'construction_vehicle',
-                            'bus',
-                            'truck',
-                            'trailer',
-                    ]:
-                        attr = 'vehicle.moving'
-                    elif name in ['bicycle', 'motorcycle']:
-                        attr = 'cycle.with_rider'
+                boxes = lidar_nusc_box_to_global(self.data_infos[sample_id], boxes,
+                                                det_mapped_class_names,
+                                                self.custom_eval_detection_configs,
+                                                self.eval_version)
+                for i, box in enumerate(boxes):
+                    if box.score < score_thresh:
+                        continue
+                    name = det_mapped_class_names[box.label]
+                    if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
+                        if name in [
+                                'car',
+                                'construction_vehicle',
+                                'bus',
+                                'truck',
+                                'trailer',
+                        ]:
+                            attr = 'vehicle.moving'
+                        elif name in ['bicycle', 'motorcycle']:
+                            attr = 'cycle.with_rider'
+                        else:
+                            attr = NuScenesDataset.DefaultAttribute[name]
                     else:
-                        attr = NuScenesDataset.DefaultAttribute[name]
-                else:
-                    if name in ['pedestrian']:
-                        attr = 'pedestrian.standing'
-                    elif name in ['bus']:
-                        attr = 'vehicle.stopped'
-                    else:
-                        attr = NuScenesDataset.DefaultAttribute[name]
+                        if name in ['pedestrian']:
+                            attr = 'pedestrian.standing'
+                        elif name in ['bus']:
+                            attr = 'vehicle.stopped'
+                        else:
+                            attr = NuScenesDataset.DefaultAttribute[name]
 
-                nusc_anno = dict(
-                    sample_token=sample_token,
-                    translation=box.center.tolist(),
-                    size=box.wlh.tolist(),
-                    rotation=box.orientation.elements.tolist(),
-                    velocity=box.velocity[:2].tolist(),
-                    detection_name=name,
-                    detection_score=box.score,
-                    attribute_name=attr,
-                    fut_traj=box.fut_trajs.tolist())
-                annos.append(nusc_anno)
-            nusc_annos[sample_token] = annos
+                    nusc_anno = dict(
+                        sample_token=sample_token,
+                        translation=box.center.tolist(),
+                        size=box.wlh.tolist(),
+                        rotation=box.orientation.elements.tolist(),
+                        velocity=box.velocity[:2].tolist(),
+                        detection_name=name,
+                        detection_score=box.score,
+                        attribute_name=attr,
+                        fut_traj=box.fut_trajs.tolist())
+                    annos.append(nusc_anno)
+                nusc_annos[sample_token] = annos
 
 
-            map_pred_anno = {}
-            vecs = output_to_vecs(det)
-            sample_token = self.data_infos[sample_id]['token']
-            map_pred_anno['sample_token'] = sample_token
-            pred_vec_list=[]
-            for i, vec in enumerate(vecs):
-                name = map_mapped_class_names[vec['label']]
-                anno = dict(
-                    # sample_token=sample_token,
-                    pts=vec['pts'],
-                    pts_num=len(vec['pts']),
-                    cls_name=name,
-                    type=vec['label'],
-                    confidence_level=vec['score'])
-                pred_vec_list.append(anno)
-                # annos.append(nusc_anno)
-            # nusc_annos[sample_token] = annos
-            map_pred_anno['vectors'] = pred_vec_list
-            map_pred_annos[sample_token] = map_pred_anno
+                map_pred_anno = {}
+                vecs = output_to_vecs(pts_bbox)
+                sample_token = self.data_infos[sample_id]['token']
+                map_pred_anno['sample_token'] = sample_token
+                pred_vec_list=[]
+                for i, vec in enumerate(vecs):
+                    name = map_mapped_class_names[vec['label']]
+                    anno = dict(
+                        # sample_token=sample_token,
+                        pts=vec['pts'],
+                        pts_num=len(vec['pts']),
+                        cls_name=name,
+                        type=vec['label'],
+                        confidence_level=vec['score'])
+                    pred_vec_list.append(anno)
+                    # annos.append(nusc_anno)
+                # nusc_annos[sample_token] = annos
+                map_pred_anno['vectors'] = pred_vec_list
+                map_pred_annos[sample_token] = map_pred_anno
 
-        if not os.path.exists(self.map_ann_file):
-            self._format_gt()
-        else:
-            print(f'{self.map_ann_file} exist, not update')
-        # with open(self.map_ann_file,'r') as f:
-        #     GT_anns = json.load(f)
-        # gt_annos = GT_anns['GTs']
+            if not os.path.exists(self.map_ann_file):
+                self._format_gt()
+            else:
+                print(f'{self.map_ann_file} exist, not update')
+            # with open(self.map_ann_file,'r') as f:
+            #     GT_anns = json.load(f)
+            # gt_annos = GT_anns['GTs']
 
-        nusc_submissions = {
-            'meta': self.modality,
-            'results': nusc_annos,
-            'map_results': map_pred_annos,
-            'plan_results': plan_annos,
-            # 'GTs': gt_annos
-        }
+            nusc_submissions = {
+                'meta': self.modality,
+                'results': nusc_annos,
+                'map_results': map_pred_annos,
+                'plan_results': plan_annos,
+                'metrics': metrics,
+                'inputs': inputs,
+                # 'GTs': gt_annos
+            }
+            return nusc_submissions
+
+        print(f'Processing main ...')
+        formatted = process(results)
+        formatted['generalization'] = []
+        for i in range(len(results[0]['generalization'])):
+            print(f'Processing generalization {i}/{len(results[0]["generalization"])}...')
+            gen = [res['generalization'][i] for res in results]
+            formatted['generalization'].append(process(gen))
 
         mmcv.mkdir_or_exist(jsonfile_prefix)
         if self.use_pkl_result:
@@ -1565,7 +1583,7 @@ class GenADCustomNuScenesDataset(NuScenesDataset):
             assert False
             res_path = osp.join(jsonfile_prefix, 'results_nusc.json')
         print('Results writes to', res_path)
-        mmcv.dump(nusc_submissions, res_path)
+        mmcv.dump(formatted, res_path)
         return res_path
 
     def format_results(self, results, file_name, jsonfile_prefix=None):
@@ -1609,22 +1627,25 @@ class GenADCustomNuScenesDataset(NuScenesDataset):
             result_files = self._format_bbox(results, jsonfile_prefix)
         else:
             # should take the inner dict out of 'pts_bbox' or 'img_bbox' dict
-            result_files = dict()
-            result_input = dict()
-            for name in results[0]:
-                if name == 'pts_bbox':
-                    print(f'\nFormating bboxes of {name}')
-                    results_ = [res[name] for res in results]
-                    tmp_file_ = osp.join(jsonfile_prefix, name)
-                    # 在此处规整
-                    result_files.update({name: self._format_bbox(results_, file_name, jsonfile_prefix=tmp_file_)})
-                elif name == 'input':
-                    inputs_ = [res[name] for res in results]
-                    for sample_id, input in enumerate(inputs_):
-                        sample_token = self.data_infos[sample_id]['token']
-                        result_input[sample_token] = input
-                else:
-                    pass
+            result_files = {
+                'pts_bbox': self._format_bbox(results, file_name, jsonfile_prefix=osp.join(jsonfile_prefix, 'pts_bbox'))
+            }
+            # result_files = dict()
+            # result_input = dict()
+            # for name in results[0]:
+            #     if name == 'pts_bbox':
+            #         print(f'\nFormating bboxes of {name}')
+            #         results_ = [res[name] for res in results]
+            #         tmp_file_ = osp.join(jsonfile_prefix, name)
+            #         # 在此处规整
+            #         result_files.update({name: self._format_bbox(results, file_name, jsonfile_prefix=tmp_file_)})
+            #     elif name == 'input':
+            #         inputs_ = [res[name] for res in results]
+            #         for sample_id, input in enumerate(inputs_):
+            #             sample_token = self.data_infos[sample_id]['token']
+            #             result_input[sample_token] = input
+            #     else:
+            #         pass
             
             # # 将input信息也保存下来
             # 这里太卡了，蚌埠住了，先注释掉

@@ -260,21 +260,22 @@ def main():
             else:
                 mmcv.dump(outputs['bbox_results'], args.out)
         kwargs = {} if args.eval_options is None else args.eval_options
-        folder_name = 'with_description_ca'
-        if cfg.use_description:
-            folder_name = 'with_description_ca'
-            if cfg.description_ca_bev:
-                folder_name += '_bev'
-            if cfg.description_ca_map:
-                folder_name += '_map'
-            if cfg.description_ca_motion:
-                folder_name += '_motion'
-        else:
-            folder_name = 'without_description'
-        kwargs['jsonfile_prefix'] = osp.join(
-            'test', 
-            folder_name
-        )
+        # folder_name = 'with_description_ca'
+        # if cfg.use_description:
+        #     folder_name = 'with_description_ca'
+        #     if cfg.description_ca_bev:
+        #         folder_name += '_bev'
+        #     if cfg.description_ca_map:
+        #         folder_name += '_map'
+        #     if cfg.description_ca_motion:
+        #         folder_name += '_motion'
+        # else:
+        #     folder_name = 'without_description'
+        # kwargs['jsonfile_prefix'] = osp.join(
+        #     'test', 
+        #     folder_name
+        # )
+        kwargs['jsonfile_prefix'] = 'test'
         if args.format_only:
             assert False
             dataset.format_results(outputs['bbox_results'], **kwargs)

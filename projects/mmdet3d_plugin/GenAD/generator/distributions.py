@@ -1,6 +1,6 @@
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from mmdet.models import LOSSES
 
@@ -25,6 +25,16 @@ class DistributionModule(nn.Module):
         #     self.compress_dim,
         # )
 
+        self.risk_encoder = nn.Sequential(
+            nn.Linear(1, in_channels//4),
+            nn.LayerNorm(in_channels//4),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels//4, in_channels//2),
+            nn.LayerNorm(in_channels//2),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels//2, in_channels),
+        )
+
         self.encoder = DistributionEncoder1DV2(
             in_channels,
             self.compress_dim,
@@ -35,7 +45,8 @@ class DistributionModule(nn.Module):
             nn.Conv1d(self.compress_dim, out_channels=2 * self.latent_dim, kernel_size=1)
         )
 
-    def forward(self, s_t):
+    def forward(self, risk_value, s_t):
+        s_t = F.layer_norm(s_t + self.risk_encoder(risk_value), [s_t.shape[-1]])
         encoding = self.encoder(  # [1, xxx/2, 1801]
             s_t.permute(0, 2, 1)  # [1, 1801, xxx] -> [1, xxx, 1801]
         )

@@ -50,12 +50,14 @@ class CustomDefaultFormatBundle3D(DefaultFormatBundle3D):
             if 'ego_lcf_feat' in results:
                 results['ego_lcf_feat'] = DC(to_tensor(results['ego_lcf_feat'][None, None, ...]), stack=True)
             if 'gt_attr_labels' in results:
-                results['gt_attr_labels'] = DC(to_tensor(results['gt_attr_labels']), cpu_only=False)\
+                results['gt_attr_labels'] = DC(to_tensor(results['gt_attr_labels']), cpu_only=False)
         
-        if 'contents' in results:
-            results['contents'] = DC(np.array(results['contents']).reshape(-1), cpu_only=True, stack=False)
-        if 'answers' in results:
-            results['answers'] = DC(np.array(results['answers']).reshape(-1), cpu_only=True, stack=False)
-        if 'answers_token' in results:
-            results['answers_token'] = DC(np.array(results['answers_token']), cpu_only=True, stack=False)
+        # if 'contents' in results:
+        #     results['contents'] = DC(np.array(results['contents']).reshape(-1), cpu_only=True, stack=False)
+        # if 'answers' in results:
+        #     results['answers'] = DC(np.array(results['answers']).reshape(-1), cpu_only=True, stack=False)
+        # if 'answers_token' in results:
+        #     results['answers_token'] = DC(np.array(results['answers_token']), cpu_only=True, stack=False)
+        if 'risk_value' in results:
+            results['risk_value'] = DC(to_tensor(results['risk_value'][None, ...]), stack=True, pad_dims=None)
         return results

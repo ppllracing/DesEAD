@@ -391,7 +391,8 @@ train_pipeline = [
                'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'gt_attr_labels',
             #    'road_type', 'road_type_one_hot', 'road_type_all',
             #    'traffic_condition', 'traffic_condition_one_hot', 'traffic_condition_all',
-               'contents', 'answers', 'answers_token'
+            #    'contents', 'answers', 'answers_token', 
+               'risk_value'
                ])
 ]
 
@@ -422,7 +423,8 @@ test_pipeline = [
                        'ego_lcf_feat', 'gt_attr_labels',
                     #    'road_type', 'road_type_one_hot', 'road_type_all',
                     #    'traffic_condition', 'traffic_condition_one_hot', 'traffic_condition_all',
-                       'contents', 'answers', 'answers_token'
+                    #    'contents', 'answers', 'answers_token', 
+                       'risk_value'
                     ])])
 ]
 
@@ -432,8 +434,8 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        # ann_file=data_root_ + 'vad_nuscenes_infos_temporal_train.pkl',
-        ann_file=data_root_ + 'vad_nuscenes_infos_temporal_train_with_description.pkl',
+        ann_file=data_root_ + 'vad_nuscenes_infos_temporal_train.pkl',
+        # ann_file=data_root_ + 'vad_nuscenes_infos_temporal_train_with_description.pkl',
         # ann_file=data_root_ + 'genad_nuscenes_infos_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
@@ -453,8 +455,8 @@ data = dict(
     val=dict(type=dataset_type,
              pc_range=point_cloud_range,
              data_root=data_root,
-            #  ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val.pkl',
-             ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val_with_description.pkl',
+             ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val.pkl',
+            #  ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val_with_description.pkl',
             #  ann_file=data_root_ + 'genad_nuscenes_infos_val.pkl',
              pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
              classes=class_names, modality=input_modality, samples_per_gpu=1,
@@ -467,8 +469,8 @@ data = dict(
     test=dict(type=dataset_type,
               data_root=data_root,
               pc_range=point_cloud_range,
-            #  ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val.pkl',
-              ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val_with_description.pkl',
+              ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val.pkl',
+            #   ann_file=data_root_ + 'vad_nuscenes_infos_temporal_val_with_description.pkl',
             #   ann_file=data_root_ + 'genad_nuscenes_infos_val.pkl',
             #   ann_file=data_root_ + 'vad_nuscenes_infos_temporal_test_with_description.pkl',
               pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),

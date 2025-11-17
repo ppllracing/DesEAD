@@ -151,6 +151,7 @@ class GenADHead(DETRHead):
                  ego_fut_mode=5,  # 3 -> 5，5种类型的指令
                  loss_plan_reg=dict(type='L1Loss', loss_weight=0.25),
                  loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.1),
+                 loss_plan_risk=dict(type='PlanRiskLoss', loss_weight=0.1),
                  loss_plan_col=dict(type='PlanAgentDisLoss', loss_weight=0.1),
                  loss_plan_dir=dict(type='PlanMapThetaLoss', loss_weight=0.1),
                  ego_agent_decoder=None,
@@ -278,6 +279,9 @@ class GenADHead(DETRHead):
                 self.description_map_ca = build_transformer_layer_sequence(self.description_map_ca)
             if self.description_ca_motion:
                 self.description_motion_ca = build_transformer_layer_sequence(self.description_motion_ca)
+        
+        self.risk_encoder = MLP(1, 32)
+        # self.risk_decoder = MLP(1, 32)
 
         # cmd部分
         # self.cmd_query = nn.Embedding(self.ego_fut_mode, self.embed_dims)
@@ -316,6 +320,7 @@ class GenADHead(DETRHead):
         self.loss_map_dir = build_loss(loss_map_dir)
         self.loss_plan_reg = build_loss(loss_plan_reg)
         self.loss_plan_bound = build_loss(loss_plan_bound)
+        self.loss_plan_risk = build_loss(loss_plan_risk)
         self.loss_plan_col = build_loss(loss_plan_col)
         self.loss_plan_dir = build_loss(loss_plan_dir)
         self.loss_vae_gen = build_loss(loss_vae_gen)
@@ -554,7 +559,8 @@ class GenADHead(DETRHead):
                 gt_attr_labels=None,
                 ego_fut_trajs=None,
                 ego_fut_cmd=None,
-                description_feats=None
+                description_feats=None,
+                risk_value=None
                 ):
         """Forward function.
         Args:
@@ -854,8 +860,9 @@ class GenADHead(DETRHead):
             assert self.probabilistic, "probabilistic computation should be enabled."
             # Do probabilistic computation
             sample, distribution_comp = self.distribution_forward(  # [1, 32, 1801], dict
-                current_states, future_distribution_inputs, noise
+                risk_value, current_states, future_distribution_inputs, noise
             )
+            # predict
             states_hs, future_states_hs = self.future_states_predict(  # [6, 1, 1801, 1024], [6, 1, 1801, 512]
                 batch_size=batch_size,  # 1
                 sample=sample,  # [1, 32, 1801]
@@ -1234,7 +1241,8 @@ class GenADHead(DETRHead):
                       agent_preds,
                       agent_fut_preds,
                       agent_score_preds,
-                      agent_fut_cls_preds):
+                      agent_fut_cls_preds,
+                      ego_risk_ref):
         """"Loss function for ego vehicle planning.
         Args:
             ego_fut_preds (Tensor): [B, ego_fut_mode, fut_ts, 2]
@@ -1271,6 +1279,15 @@ class GenADHead(DETRHead):
             weight=ego_fut_masks
         )
 
+        loss_plan_risk = self.loss_plan_risk(
+            ego_fut_preds[ego_fut_cmd == 1],
+            agent_preds,
+            agent_fut_preds,
+            agent_score_preds,
+            agent_fut_cls_preds,
+            ego_risk_ref
+        )
+
         loss_plan_col = self.loss_plan_col(
             ego_fut_preds[ego_fut_cmd == 1],
             agent_preds,
@@ -1296,6 +1313,7 @@ class GenADHead(DETRHead):
         loss_plan_dict = dict()
         loss_plan_dict['loss_plan_reg'] = loss_plan_l1
         loss_plan_dict['loss_plan_bound'] = loss_plan_bound
+        loss_plan_dict['loss_plan_risk'] = loss_plan_risk
         loss_plan_dict['loss_plan_col'] = loss_plan_col
         loss_plan_dict['loss_plan_dir'] = loss_plan_dir
 
@@ -1622,6 +1640,7 @@ class GenADHead(DETRHead):
              gt_attr_labels,
              gt_bboxes_ignore=None,
              map_gt_bboxes_ignore=None,
+             risk_value=None,
              img_metas=None
             ):
         """"Loss function.
@@ -1753,11 +1772,13 @@ class GenADHead(DETRHead):
         loss_plan_input = [ego_fut_preds, ego_fut_gt, ego_fut_masks, ego_fut_cmd,
                            map_all_pts_preds[-1], map_all_cls_scores[-1].sigmoid(),
                            all_bbox_preds[-1][..., 0:2], agent_fut_preds,
-                           all_cls_scores[-1].sigmoid(), agent_fut_cls_preds.sigmoid()]
+                           all_cls_scores[-1].sigmoid(), agent_fut_cls_preds.sigmoid(),
+                           risk_value]
 
         loss_planning_dict = self.loss_planning(*loss_plan_input)
         loss_dict['loss_plan_reg'] = loss_planning_dict['loss_plan_reg']
         loss_dict['loss_plan_bound'] = loss_planning_dict['loss_plan_bound']
+        loss_dict['loss_plan_risk'] = loss_planning_dict['loss_plan_risk']
         loss_dict['loss_plan_col'] = loss_planning_dict['loss_plan_col']
         loss_dict['loss_plan_dir'] = loss_planning_dict['loss_plan_dir']
 
@@ -2023,7 +2044,7 @@ class GenADHead(DETRHead):
 
         return selected_query, selected_query_pos, selected_padding_mask
 
-    def distribution_forward(self, present_features, future_distribution_inputs=None, noise=None):
+    def distribution_forward(self, risk_value, present_features, future_distribution_inputs=None, noise=None):
         """distribution_forward.
         Args:
             present_features:: output features of transformer model.
@@ -2042,6 +2063,7 @@ class GenADHead(DETRHead):
 
         # 根据经过一系列计算得到的特征，计算当前的分布
         present_mu, present_log_sigma = self.present_distribution(  # [1, 1, 32], [1, 1, 32]
+            risk_value,  # [1, 1, 1]
             present_features  # [1, 1801, 512]
         )
 
@@ -2075,7 +2097,10 @@ class GenADHead(DETRHead):
                 present_features,  # [1, 1801, 512]
                 future_distribution_inputs  # [1, 1801, 12]
             ], dim=2)
-            future_mu, future_log_sigma = self.future_distribution(future_features)
+            future_mu, future_log_sigma = self.future_distribution(
+                risk_value,  # [1, 1, 1]
+                future_features  # [1, 1801, 524]
+            )
             mu = future_mu  # [1, 1, 32]
             sigma = torch.exp(future_log_sigma)  # [1, 1, 32]
         else:

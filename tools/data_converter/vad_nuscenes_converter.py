@@ -2,6 +2,7 @@ import os
 import math
 import copy
 import argparse
+import matplotlib.pyplot as plt
 from os import path as osp
 from collections import OrderedDict
 from typing import List, Tuple, Union
@@ -47,6 +48,38 @@ nus_attributes = ('cycle.with_rider', 'cycle.without_rider',
                   'vehicle.parked', 'vehicle.stopped', 'None')
 
 ego_width, ego_length = 1.85, 4.084
+
+# 他车的质量相对于自车的倍数
+MASS = {
+    'barrier': 2.5,
+    'bicycle': 0.5,
+    'bus': 2.0,
+    'car': 1.0,
+    'construction_vehicle': 1.0,
+    'motorcycle': 1.0,
+    'pedestrian': 0.5,
+    'traffic_cone': 0.0,
+    'trailer': 2.5,
+    'truck': 2.5
+}
+# 他车的危险系数
+Risk_K = {
+    'barrier': 2.5,
+    'bicycle': 0.5,
+    'bus': 2.0,
+    'car': 1.0,
+    'construction_vehicle': 1.0,
+    'motorcycle': 1.0,
+    'pedestrian': 0.5,
+    'traffic_cone': 0.0,
+    'trailer': 2.5,
+    'truck': 2.5
+}
+# 环境因素
+Risk_C = 1.0
+# 横向衰减系数
+Risk_beta = 0.5
+
 
 def quart_to_rpy(qua):
     x, y, z, w = qua
@@ -302,6 +335,29 @@ def get_traffic_condition(agents, names):
 
     return traffic_condition, traffic_condition_one_hot, types
 
+def compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance):
+    m = MASS.get(agent_name, 2.0)
+    k = Risk_K.get(agent_name, 2.0)
+    c = Risk_C
+    beta = Risk_beta
+
+    # 位移变化替代速度
+    ego_v = np.linalg.norm(ego_dxy)
+    agent_v = np.linalg.norm(agent_dxy)
+
+    # 计算运动角度
+    theta = math.acos(np.dot(ego_dxy, agent_dxy) / (np.linalg.norm(ego_dxy) * np.linalg.norm(agent_dxy) + 1e-8))
+
+    # 计算系数
+    v = 60 / 3.6  # 60 km/h，论文中没有说波速如何定义，此处用城市道路通常速度代替
+    alpha_lon = max(0, (v + ego_v * math.cos(theta)) / (v - agent_v * math.cos(theta)))
+    alpha_lat = math.exp(-beta * (math.sin(theta) ** 2))
+
+    e = 0.5 * k * c * m * (ego_v - agent_v) ** 2 / distance
+    e = alpha_lon * alpha_lat * e
+    # return math.log(e + 1 + 1e-6)
+    return e
+
 def _fill_trainval_infos(nusc: NuScenes,
                          nusc_can_bus,
                          train_scenes,
@@ -330,6 +386,8 @@ def _fill_trainval_infos(nusc: NuScenes,
     cat2idx = {}
     for idx, dic in enumerate(nusc.category):
         cat2idx[dic['name']] = idx
+
+    risks = []
 
     for sample in mmcv.track_iter_progress(nusc.sample):
         if not sample['scene_token'] in [*train_scenes, *val_scenes]:
@@ -449,260 +507,306 @@ def _fill_trainval_infos(nusc: NuScenes,
 
         # obtain annotation
         # 获取所有被标注物体的信息，包括物体属性和位姿信息
-        if not test:
-            # 获取标注物信息
-            annotations = [nusc.get('sample_annotation', token) for token in sample['anns']]
+        # if not test:
+        # 获取标注物信息
+        annotations = [nusc.get('sample_annotation', token) for token in sample['anns']]
 
-            # 获取物体的速度和有效性
-            velocity = np.array([nusc.box_velocity(token)[:2] for token in sample['anns']])
-            valid_flag = np.array([(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0 for anno in annotations], dtype=bool).reshape(-1)
+        # 获取物体的速度和有效性
+        velocity = np.array([nusc.box_velocity(token)[:2] for token in sample['anns']])
+        valid_flag = np.array([(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0 for anno in annotations], dtype=bool).reshape(-1)
 
-            # 从boxes中获取定位、尺寸和姿态
-            locs = np.array([b.center for b in boxes]).reshape(-1, 3)
-            dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
-            rots = np.array([b.orientation.yaw_pitch_roll[0] for b in boxes]).reshape(-1, 1)
+        # 从boxes中获取定位、尺寸和姿态
+        locs = np.array([b.center for b in boxes]).reshape(-1, 3)
+        dims = np.array([b.wlh for b in boxes]).reshape(-1, 3)
+        rots = np.array([b.orientation.yaw_pitch_roll[0] for b in boxes]).reshape(-1, 1)
 
-            # convert velo from global to lidar
-            # 将物体的全局速度转化为雷达坐标系下的速度，个人理解为将ego设定为静止，计算其他物体的相对速度
-            for i in range(len(boxes)):
-                velo = np.array([*velocity[i], 0.0])
-                velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T
-                velocity[i] = velo[:2]
-            
-            # 获取物体的名称
-            names = [b.name for b in boxes]
-            for i in range(len(names)):
-                if names[i] in NuScenesDataset.NameMapping:
-                    # 规整名字，比如说，'human.pedestrian.adult' -> 'pedestrian'
-                    names[i] = NuScenesDataset.NameMapping[names[i]]
-            names = np.array(names)
+        # convert velo from global to lidar
+        # 将物体的全局速度转化为雷达坐标系下的速度，个人理解为将ego设定为静止，计算其他物体的相对速度
+        for i in range(len(boxes)):
+            velo = np.array([*velocity[i], 0.0])
+            velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T
+            velocity[i] = velo[:2]
+        
+        # 获取物体的名称
+        names = [b.name for b in boxes]
+        for i in range(len(names)):
+            if names[i] in NuScenesDataset.NameMapping:
+                # 规整名字，比如说，'human.pedestrian.adult' -> 'pedestrian'
+                names[i] = NuScenesDataset.NameMapping[names[i]]
+        names = np.array(names)
 
-            # we need to convert rot to SECOND format.
-            gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)  # [num_box, 7]
-            assert len(gt_boxes) == len(annotations), f'{len(gt_boxes)}, {len(annotations)}'
-            
-            # get future coords for each box
-            num_box = len(boxes)
-            gt_fut_trajs = np.zeros((num_box, fut_ts, 2))  # [num_box, fut_ts, 2]
-            gt_fut_yaw = np.zeros((num_box, fut_ts))  # [num_box, fut_ts]
-            gt_fut_masks = np.zeros((num_box, fut_ts))  # [num_box, fut_ts]
-            gt_boxes_yaw = -(gt_boxes[:,6] + np.pi / 2)  # -(-rots - np.pi / 2 + np.pi / 2) = rots
-            agent_lcf_feat = np.zeros((num_box, 9))  # [num_box, 9], (x, y, yaw, vx, vy, width, length, height, type)
-            gt_fut_goal = np.zeros((num_box))
-            # 遍历所有annotations
-            for i, anno in enumerate(annotations):
-                cur_box = boxes[i]
-                cur_anno = anno
-                agent_lcf_feat[i, 0:2] = cur_box.center[:2]	
-                agent_lcf_feat[i, 2] = gt_boxes_yaw[i]
-                agent_lcf_feat[i, 3:5] = velocity[i]
-                agent_lcf_feat[i, 5:8] = anno['size'] # width,length,height
-                agent_lcf_feat[i, 8] = cat2idx[anno['category_name']] if anno['category_name'] in cat2idx.keys() else -1
-                # 获取未来fut_ts帧的状态
-                for j in range(fut_ts):
-                    if cur_anno['next'] != '':
-                        anno_next = nusc.get('sample_annotation', cur_anno['next'])
-                        box_next = Box(
-                            anno_next['translation'], anno_next['size'], Quaternion(anno_next['rotation'])
-                        )
-                        # Move box to ego vehicle coord system.
-                        box_next.translate(-np.array(pose_record['translation']))
-                        box_next.rotate(Quaternion(pose_record['rotation']).inverse)
-                        #  Move box to sensor coord system.
-                        box_next.translate(-np.array(cs_record['translation']))
-                        box_next.rotate(Quaternion(cs_record['rotation']).inverse)
-                        gt_fut_trajs[i, j] = box_next.center[:2] - cur_box.center[:2]
-                        gt_fut_masks[i, j] = 1
-                        # add yaw diff，将四元素转换为欧拉角
-                        _, _, box_yaw = quart_to_rpy([
-                            cur_box.orientation.x, cur_box.orientation.y,
-                            cur_box.orientation.z, cur_box.orientation.w
-                        ])
-                        _, _, box_yaw_next = quart_to_rpy([
-                            box_next.orientation.x, box_next.orientation.y,
-                            box_next.orientation.z, box_next.orientation.w
-                        ])
-                        gt_fut_yaw[i, j] = box_yaw_next - box_yaw
-                        cur_anno = anno_next
-                        cur_box = box_next
-                    else:
-                        gt_fut_trajs[i, j:] = 0
-                        break
-
-                # get agent goal
-                gt_fut_coords = np.cumsum(gt_fut_trajs[i], axis=-2)
-                coord_diff = gt_fut_coords[-1] - gt_fut_coords[0]
-                if coord_diff.max() < 1.0: # static
-                    gt_fut_goal[i] = 9
+        # we need to convert rot to SECOND format.
+        gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)  # [num_box, 7]
+        assert len(gt_boxes) == len(annotations), f'{len(gt_boxes)}, {len(annotations)}'
+        
+        # get future coords for each box
+        num_box = len(boxes)
+        gt_fut_trajs = np.zeros((num_box, fut_ts, 2))  # [num_box, fut_ts, 2]
+        gt_fut_yaw = np.zeros((num_box, fut_ts))  # [num_box, fut_ts]
+        gt_fut_masks = np.zeros((num_box, fut_ts))  # [num_box, fut_ts]
+        gt_boxes_yaw = -(gt_boxes[:,6] + np.pi / 2)  # -(-rots - np.pi / 2 + np.pi / 2) = rots
+        agent_lcf_feat = np.zeros((num_box, 9))  # [num_box, 9], (x, y, yaw, vx, vy, width, length, height, type)
+        gt_fut_goal = np.zeros((num_box))
+        # 遍历所有annotations
+        for i, anno in enumerate(annotations):
+            cur_box = boxes[i]
+            cur_anno = anno
+            agent_lcf_feat[i, 0:2] = cur_box.center[:2]	
+            agent_lcf_feat[i, 2] = gt_boxes_yaw[i]
+            agent_lcf_feat[i, 3:5] = velocity[i]
+            agent_lcf_feat[i, 5:8] = anno['size'] # width,length,height
+            agent_lcf_feat[i, 8] = cat2idx[anno['category_name']] if anno['category_name'] in cat2idx.keys() else -1
+            # 获取未来fut_ts帧的状态
+            for j in range(fut_ts):
+                if cur_anno['next'] != '':
+                    anno_next = nusc.get('sample_annotation', cur_anno['next'])
+                    box_next = Box(
+                        anno_next['translation'], anno_next['size'], Quaternion(anno_next['rotation'])
+                    )
+                    # Move box to ego vehicle coord system.
+                    box_next.translate(-np.array(pose_record['translation']))
+                    box_next.rotate(Quaternion(pose_record['rotation']).inverse)
+                    #  Move box to sensor coord system.
+                    box_next.translate(-np.array(cs_record['translation']))
+                    box_next.rotate(Quaternion(cs_record['rotation']).inverse)
+                    gt_fut_trajs[i, j] = box_next.center[:2] - cur_box.center[:2]
+                    gt_fut_masks[i, j] = 1
+                    # add yaw diff，将四元素转换为欧拉角
+                    _, _, box_yaw = quart_to_rpy([
+                        cur_box.orientation.x, cur_box.orientation.y,
+                        cur_box.orientation.z, cur_box.orientation.w
+                    ])
+                    _, _, box_yaw_next = quart_to_rpy([
+                        box_next.orientation.x, box_next.orientation.y,
+                        box_next.orientation.z, box_next.orientation.w
+                    ])
+                    gt_fut_yaw[i, j] = box_yaw_next - box_yaw
+                    cur_anno = anno_next
+                    cur_box = box_next
                 else:
-                    box_mot_yaw = np.arctan2(coord_diff[1], coord_diff[0]) + np.pi
-                    gt_fut_goal[i] = box_mot_yaw // (np.pi / 4)  # 0-8: goal direction class
-
-            # get ego history traj (offset format)
-            # 获取车辆历史轨迹
-            ego_his_trajs = np.zeros((his_ts+1, 3))
-            ego_his_trajs_diff = np.zeros((his_ts+1, 3))
-            sample_cur = sample
-            for i in range(his_ts, -1, -1):
-                if sample_cur is not None:
-                    pose_mat = get_global_sensor_pose(sample_cur, nusc, inverse=False)
-                    ego_his_trajs[i] = pose_mat[:3, 3]
-                    has_prev = sample_cur['prev'] != ''
-                    has_next = sample_cur['next'] != ''
-                    if has_next:
-                        sample_next = nusc.get('sample', sample_cur['next'])
-                        pose_mat_next = get_global_sensor_pose(sample_next, nusc, inverse=False)
-                        ego_his_trajs_diff[i] = pose_mat_next[:3, 3] - ego_his_trajs[i]
-                    sample_cur = nusc.get('sample', sample_cur['prev']) if has_prev else None
-                else:
-                    ego_his_trajs[i] = ego_his_trajs[i+1] - ego_his_trajs_diff[i+1]
-                    ego_his_trajs_diff[i] = ego_his_trajs_diff[i+1]
-            
-            # global to ego at lcf
-            ego_his_trajs = ego_his_trajs - np.array(pose_record['translation'])
-            rot_mat = Quaternion(pose_record['rotation']).inverse.rotation_matrix
-            ego_his_trajs = np.dot(rot_mat, ego_his_trajs.T).T
-            # ego to lidar at lcf
-            ego_his_trajs = ego_his_trajs - np.array(cs_record['translation'])
-            rot_mat = Quaternion(cs_record['rotation']).inverse.rotation_matrix
-            ego_his_trajs = np.dot(rot_mat, ego_his_trajs.T).T
-            ego_his_trajs = ego_his_trajs[1:] - ego_his_trajs[:-1]
-
-            # get ego futute traj (offset format)
-            # 获取车辆未来轨迹
-            ego_fut_trajs = np.zeros((fut_ts+1, 3))
-            ego_fut_masks = np.zeros((fut_ts+1))
-            sample_cur = sample
-            for i in range(fut_ts+1):
-                pose_mat = get_global_sensor_pose(sample_cur, nusc, inverse=False)
-                ego_fut_trajs[i] = pose_mat[:3, 3]
-                ego_fut_masks[i] = 1
-                if sample_cur['next'] == '':
-                    ego_fut_trajs[i+1:] = ego_fut_trajs[i]
+                    gt_fut_trajs[i, j:] = 0
                     break
-                else:
-                    sample_cur = nusc.get('sample', sample_cur['next'])
-            # global to ego at lcf
-            ego_fut_trajs = ego_fut_trajs - np.array(pose_record['translation'])
-            rot_mat = Quaternion(pose_record['rotation']).inverse.rotation_matrix
-            ego_fut_trajs = np.dot(rot_mat, ego_fut_trajs.T).T
-            # ego to lidar at lcf
-            ego_fut_trajs = ego_fut_trajs - np.array(cs_record['translation'])
-            rot_mat = Quaternion(cs_record['rotation']).inverse.rotation_matrix
-            ego_fut_trajs = np.dot(rot_mat, ego_fut_trajs.T).T
 
-            # 至此，已经获取了ego和其他agent相对于ego的未来轨迹信息
-            # xy：x代表了左右偏移量，y代表了向前偏移量
-            # 接下来，需要根据这些信息生成比较合适的指令
-            # 左转：x < -2，
-            # 左偏转：-2 < x < -1
-            # 直行：-1 < x < 1
-            # 右偏转：1 < x < 2
-            # 右转：2 < x
-
-            # drive command according to final fut step offset from lcfw
-            # 生成指令
-            x_end = ego_fut_trajs[-1, 0]
-            command = np.zeros(5)
-            if x_end <= -2:
-                command[0] = 1  # 左转
-            elif -2 < x_end <= -1:
-                command[1] = 1  # 左偏转
-            elif -1 < x_end < 1:
-                command[2] = 1  # 直行
-            elif 1 <= x_end < 2:
-                command[3] = 1  # 右偏转
-            elif 2 <= x_end:
-                command[4] = 1  # 右转
+            # get agent goal
+            gt_fut_coords = np.cumsum(gt_fut_trajs[i], axis=-2)
+            coord_diff = gt_fut_coords[-1] - gt_fut_coords[0]
+            if coord_diff.max() < 1.0: # static
+                gt_fut_goal[i] = 9
             else:
-                raise ValueError('x_end out of range')
+                box_mot_yaw = np.arctan2(coord_diff[1], coord_diff[0]) + np.pi
+                gt_fut_goal[i] = box_mot_yaw // (np.pi / 4)  # 0-8: goal direction class
 
-            # 获取当前道路交通情况
-            # traffic_condition, traffic_condition_one_hot, traffic_condition_all = get_traffic_condition(agent_lcf_feat, names)
-
-            # offset from lcf -> per-step offset
-            ego_fut_trajs = ego_fut_trajs[1:] - ego_fut_trajs[:-1]
-
-            ### ego lcf feat (vx, vy, ax, ay, w, length, width, vel, steer), w: yaw角速度
-            ego_lcf_feat = np.zeros(9)
-            # 根据odom推算自车速度及加速度
-            _, _, ego_yaw = quart_to_rpy(pose_record['rotation'])
-            ego_pos = np.array(pose_record['translation'])
-            if pose_record_prev is not None:
-                _, _, ego_yaw_prev = quart_to_rpy(pose_record_prev['rotation'])
-                ego_pos_prev = np.array(pose_record_prev['translation'])
-            if pose_record_next is not None:
-                _, _, ego_yaw_next = quart_to_rpy(pose_record_next['rotation'])
-                ego_pos_next = np.array(pose_record_next['translation'])
-            assert (pose_record_prev is not None) or (pose_record_next is not None), 'prev token and next token all empty'
-            if pose_record_prev is not None:
-                ego_w = (ego_yaw - ego_yaw_prev) / 0.5
-                ego_v = np.linalg.norm(ego_pos[:2] - ego_pos_prev[:2]) / 0.5
-                ego_vx, ego_vy = ego_v * math.cos(ego_yaw + np.pi/2), ego_v * math.sin(ego_yaw + np.pi/2)
+        # get ego history traj (offset format)
+        # 获取车辆历史轨迹
+        ego_his_trajs = np.zeros((his_ts+1, 3))
+        ego_his_trajs_diff = np.zeros((his_ts+1, 3))
+        sample_cur = sample
+        for i in range(his_ts, -1, -1):
+            if sample_cur is not None:
+                pose_mat = get_global_sensor_pose(sample_cur, nusc, inverse=False)
+                ego_his_trajs[i] = pose_mat[:3, 3]
+                has_prev = sample_cur['prev'] != ''
+                has_next = sample_cur['next'] != ''
+                if has_next:
+                    sample_next = nusc.get('sample', sample_cur['next'])
+                    pose_mat_next = get_global_sensor_pose(sample_next, nusc, inverse=False)
+                    ego_his_trajs_diff[i] = pose_mat_next[:3, 3] - ego_his_trajs[i]
+                sample_cur = nusc.get('sample', sample_cur['prev']) if has_prev else None
             else:
-                ego_w = (ego_yaw_next - ego_yaw) / 0.5
-                ego_v = np.linalg.norm(ego_pos_next[:2] - ego_pos[:2]) / 0.5
-                ego_vx, ego_vy = ego_v * math.cos(ego_yaw + np.pi/2), ego_v * math.sin(ego_yaw + np.pi/2)
+                ego_his_trajs[i] = ego_his_trajs[i+1] - ego_his_trajs_diff[i+1]
+                ego_his_trajs_diff[i] = ego_his_trajs_diff[i+1]
+        
+        # global to ego at lcf
+        ego_his_trajs = ego_his_trajs - np.array(pose_record['translation'])
+        rot_mat = Quaternion(pose_record['rotation']).inverse.rotation_matrix
+        ego_his_trajs = np.dot(rot_mat, ego_his_trajs.T).T
+        # ego to lidar at lcf
+        ego_his_trajs = ego_his_trajs - np.array(cs_record['translation'])
+        rot_mat = Quaternion(cs_record['rotation']).inverse.rotation_matrix
+        ego_his_trajs = np.dot(rot_mat, ego_his_trajs.T).T
+        ego_his_trajs = ego_his_trajs[1:] - ego_his_trajs[:-1]
 
-            ref_scene = nusc.get("scene", sample['scene_token'])
-            try:
-                pose_msgs = nusc_can_bus.get_messages(ref_scene['name'],'pose')
-                steer_msgs = nusc_can_bus.get_messages(ref_scene['name'], 'steeranglefeedback')
-                pose_uts = [msg['utime'] for msg in pose_msgs]
-                steer_uts = [msg['utime'] for msg in steer_msgs]
-                ref_utime = sample['timestamp']
-                pose_index = locate_message(pose_uts, ref_utime)
-                pose_data = pose_msgs[pose_index]
-                steer_index = locate_message(steer_uts, ref_utime)
-                steer_data = steer_msgs[steer_index]
-                # initial speed
-                v0 = pose_data["vel"][0]  # [0] means longitudinal velocity  m/s
-                # curvature (positive: turn left)
-                steering = steer_data["value"]
-                # flip x axis if in left-hand traffic (singapore)
-                flip_flag = True if map_location.startswith('singapore') else False
-                if flip_flag:
-                    steering *= -1
-                Kappa = 2 * steering / 2.588
-            except:
-                delta_x = ego_his_trajs[-1, 0] + ego_fut_trajs[0, 0]
-                delta_y = ego_his_trajs[-1, 1] + ego_fut_trajs[0, 1]
-                v0 = np.sqrt(delta_x**2 + delta_y**2)
-                Kappa = 0
+        # get ego futute traj (offset format)
+        # 获取车辆未来轨迹
+        ego_fut_trajs = np.zeros((fut_ts+1, 3))
+        ego_fut_masks = np.zeros((fut_ts+1))
+        sample_cur = sample
+        for i in range(fut_ts+1):
+            pose_mat = get_global_sensor_pose(sample_cur, nusc, inverse=False)
+            ego_fut_trajs[i] = pose_mat[:3, 3]
+            ego_fut_masks[i] = 1
+            if sample_cur['next'] == '':
+                ego_fut_trajs[i+1:] = ego_fut_trajs[i]
+                break
+            else:
+                sample_cur = nusc.get('sample', sample_cur['next'])
+        # global to ego at lcf
+        ego_fut_trajs = ego_fut_trajs - np.array(pose_record['translation'])
+        rot_mat = Quaternion(pose_record['rotation']).inverse.rotation_matrix
+        ego_fut_trajs = np.dot(rot_mat, ego_fut_trajs.T).T
+        # ego to lidar at lcf
+        ego_fut_trajs = ego_fut_trajs - np.array(cs_record['translation'])
+        rot_mat = Quaternion(cs_record['rotation']).inverse.rotation_matrix
+        ego_fut_trajs = np.dot(rot_mat, ego_fut_trajs.T).T
 
-            ego_lcf_feat[:2] = np.array([ego_vx, ego_vy]) #can_bus[13:15]
-            ego_lcf_feat[2:4] = can_bus[7:9]
-            ego_lcf_feat[4] = ego_w #can_bus[12]
-            ego_lcf_feat[5:7] = np.array([ego_length, ego_width])
-            ego_lcf_feat[7] = v0
-            ego_lcf_feat[8] = Kappa
+        # 至此，已经获取了ego和其他agent相对于ego的未来轨迹信息
+        # xy：x代表了左右偏移量，y代表了向前偏移量
+        # 接下来，需要根据这些信息生成比较合适的指令
+        # 左转：x < -2，
+        # 左偏转：-2 < x < -1
+        # 直行：-1 < x < 1
+        # 右偏转：1 < x < 2
+        # 右转：2 < x
 
-            info['gt_boxes'] = gt_boxes
-            info['gt_names'] = names
-            info['gt_velocity'] = velocity.reshape(-1, 2)
-            info['num_lidar_pts'] = np.array([a['num_lidar_pts'] for a in annotations])
-            info['num_radar_pts'] = np.array([a['num_radar_pts'] for a in annotations])
-            info['valid_flag'] = valid_flag
-            info['gt_agent_fut_trajs'] = gt_fut_trajs.reshape(-1, fut_ts*2).astype(np.float32)
-            info['gt_agent_fut_masks'] = gt_fut_masks.reshape(-1, fut_ts).astype(np.float32)
-            info['gt_agent_lcf_feat'] = agent_lcf_feat.astype(np.float32)
-            info['gt_agent_fut_yaw'] = gt_fut_yaw.astype(np.float32)
-            info['gt_agent_fut_goal'] = gt_fut_goal.astype(np.float32)
-            info['gt_ego_his_trajs'] = ego_his_trajs[:, :2].astype(np.float32)
-            info['gt_ego_fut_trajs'] = ego_fut_trajs[:, :2].astype(np.float32)
-            info['gt_ego_fut_masks'] = ego_fut_masks[1:].astype(np.float32)
-            info['gt_ego_fut_cmd'] = command.astype(np.float32)  # 指令
-            info['gt_ego_lcf_feat'] = ego_lcf_feat.astype(np.float32)
-            # info['gt_descriptions'].update({
-            #     'traffic_condition': traffic_condition,
-            #     'traffic_condition_one_hot': traffic_condition_one_hot.astype(np.float32),
-            #     'traffic_condition_all': traffic_condition_all
-            # })
+        # drive command according to final fut step offset from lcfw
+        # 生成指令
+        x_end = ego_fut_trajs[-1, 0]
+        command = np.zeros(5)
+        if x_end <= -2:
+            command[0] = 1  # 左转
+        elif -2 < x_end <= -1:
+            command[1] = 1  # 左偏转
+        elif -1 < x_end < 1:
+            command[2] = 1  # 直行
+        elif 1 <= x_end < 2:
+            command[3] = 1  # 右偏转
+        elif 2 <= x_end:
+            command[4] = 1  # 右转
+        else:
+            raise ValueError('x_end out of range')
+
+        # 获取当前道路交通情况
+        # traffic_condition, traffic_condition_one_hot, traffic_condition_all = get_traffic_condition(agent_lcf_feat, names)
+
+        # offset from lcf -> per-step offset
+        ego_fut_trajs = ego_fut_trajs[1:] - ego_fut_trajs[:-1]
+
+        ### ego lcf feat (vx, vy, ax, ay, w, length, width, vel, steer), w: yaw角速度
+        ego_lcf_feat = np.zeros(9)
+        # 根据odom推算自车速度及加速度
+        _, _, ego_yaw = quart_to_rpy(pose_record['rotation'])
+        ego_pos = np.array(pose_record['translation'])
+        if pose_record_prev is not None:
+            _, _, ego_yaw_prev = quart_to_rpy(pose_record_prev['rotation'])
+            ego_pos_prev = np.array(pose_record_prev['translation'])
+        if pose_record_next is not None:
+            _, _, ego_yaw_next = quart_to_rpy(pose_record_next['rotation'])
+            ego_pos_next = np.array(pose_record_next['translation'])
+        assert (pose_record_prev is not None) or (pose_record_next is not None), 'prev token and next token all empty'
+        if pose_record_prev is not None:
+            ego_w = (ego_yaw - ego_yaw_prev) / 0.5
+            ego_v = np.linalg.norm(ego_pos[:2] - ego_pos_prev[:2]) / 0.5
+            ego_vx, ego_vy = ego_v * math.cos(ego_yaw + np.pi/2), ego_v * math.sin(ego_yaw + np.pi/2)
+        else:
+            ego_w = (ego_yaw_next - ego_yaw) / 0.5
+            ego_v = np.linalg.norm(ego_pos_next[:2] - ego_pos[:2]) / 0.5
+            ego_vx, ego_vy = ego_v * math.cos(ego_yaw + np.pi/2), ego_v * math.sin(ego_yaw + np.pi/2)
+
+        ref_scene = nusc.get("scene", sample['scene_token'])
+        try:
+            pose_msgs = nusc_can_bus.get_messages(ref_scene['name'],'pose')
+            steer_msgs = nusc_can_bus.get_messages(ref_scene['name'], 'steeranglefeedback')
+            pose_uts = [msg['utime'] for msg in pose_msgs]
+            steer_uts = [msg['utime'] for msg in steer_msgs]
+            ref_utime = sample['timestamp']
+            pose_index = locate_message(pose_uts, ref_utime)
+            pose_data = pose_msgs[pose_index]
+            steer_index = locate_message(steer_uts, ref_utime)
+            steer_data = steer_msgs[steer_index]
+            # initial speed
+            v0 = pose_data["vel"][0]  # [0] means longitudinal velocity  m/s
+            # curvature (positive: turn left)
+            steering = steer_data["value"]
+            # flip x axis if in left-hand traffic (singapore)
+            flip_flag = True if map_location.startswith('singapore') else False
+            if flip_flag:
+                steering *= -1
+            Kappa = 2 * steering / 2.588
+        except:
+            delta_x = ego_his_trajs[-1, 0] + ego_fut_trajs[0, 0]
+            delta_y = ego_his_trajs[-1, 1] + ego_fut_trajs[0, 1]
+            v0 = np.sqrt(delta_x**2 + delta_y**2)
+            Kappa = 0
+
+        ego_lcf_feat[:2] = np.array([ego_vx, ego_vy]) #can_bus[13:15]
+        ego_lcf_feat[2:4] = can_bus[7:9]
+        ego_lcf_feat[4] = ego_w #can_bus[12]
+        ego_lcf_feat[5:7] = np.array([ego_length, ego_width])
+        ego_lcf_feat[7] = v0
+        ego_lcf_feat[8] = Kappa
+
+        # 根据轨迹计算风险值
+        risk_values = np.zeros([num_box, fut_ts])
+        # ego_fut_path = np.cumsum(ego_fut_trajs, axis=-2)
+        # agent_fut_paths = np.cumsum(gt_fut_trajs, axis=-2) + agent_lcf_feat[..., None, :2]
+        for i in range(num_box):
+            for j in range(fut_ts):
+                ego_dxy, agent_dxy = ego_fut_trajs[j, :2], gt_fut_trajs[i, j]
+                agent_pose = agent_lcf_feat[i, None, :2]
+                agent_name = names[i]
+                distance = np.linalg.norm(np.cumsum(gt_fut_trajs[i, :(j+1)], axis=-2) + agent_pose - ego_dxy)
+                risk_values[i, j] = compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance)
+        risk_value_seq = np.sum(risk_values, axis=0)  # 每个时间步的总风险值
+        risk_value = np.sum(risk_value_seq).item()  # 总风险值
+        risk_value = math.log(risk_value + 1 + 1e-6)
+        risks.append(risk_value)
+
+        # # 可视化自车和他车轨迹
+        # ego_fut_path = np.cumsum(ego_fut_trajs, axis=-2)
+        # agent_fut_paths = np.cumsum(gt_fut_trajs, axis=-2) + agent_lcf_feat[..., None, :2]
+        # fig = plt.figure()
+        # plt.plot(ego_fut_path[:, 0], ego_fut_path[:, 1])
+        # for i in range(fut_ts):
+        #     plt.plot(ego_fut_path[i, 0], ego_fut_path[i, 1], 'ro', alpha=risk_value_seq[i]/(risk_value_seq.max() + 1e-8))
+        #     plt.text(ego_fut_path[i, 0], ego_fut_path[i, 1], f'{risk_value_seq[i]:.2f}')
+        # for i in range(num_box):
+        #     plt.plot(agent_fut_paths[i, 0, 0], agent_fut_paths[i, 0, 1], 'k*')
+        #     plt.plot(agent_fut_paths[i, :, 0], agent_fut_paths[i, :, 1], '--')
+        # plt.axis('equal')
+        # os.makedirs('image/risk_vis', exist_ok=True)
+        # plt.savefig(f'image/risk_vis/{sample["token"]}.png')
+        # plt.close(fig)
+
+        info['gt_boxes'] = gt_boxes
+        info['gt_names'] = names
+        info['gt_velocity'] = velocity.reshape(-1, 2)
+        info['num_lidar_pts'] = np.array([a['num_lidar_pts'] for a in annotations])
+        info['num_radar_pts'] = np.array([a['num_radar_pts'] for a in annotations])
+        info['valid_flag'] = valid_flag
+        info['gt_agent_fut_trajs'] = gt_fut_trajs.reshape(-1, fut_ts*2).astype(np.float32)
+        info['gt_agent_fut_masks'] = gt_fut_masks.reshape(-1, fut_ts).astype(np.float32)
+        info['gt_agent_lcf_feat'] = agent_lcf_feat.astype(np.float32)
+        info['gt_agent_fut_yaw'] = gt_fut_yaw.astype(np.float32)
+        info['gt_agent_fut_goal'] = gt_fut_goal.astype(np.float32)
+        info['gt_ego_his_trajs'] = ego_his_trajs[:, :2].astype(np.float32)
+        info['gt_ego_fut_trajs'] = ego_fut_trajs[:, :2].astype(np.float32)
+        info['gt_ego_fut_masks'] = ego_fut_masks[1:].astype(np.float32)
+        info['gt_ego_fut_cmd'] = command.astype(np.float32)  # 指令
+        info['gt_ego_lcf_feat'] = ego_lcf_feat.astype(np.float32)
+        info['risk_value'] = np.array([risk_value], dtype=np.float32)
+        # info['gt_descriptions'].update({
+        #     'traffic_condition': traffic_condition,
+        #     'traffic_condition_one_hot': traffic_condition_one_hot.astype(np.float32),
+        #     'traffic_condition_all': traffic_condition_all
+        # })
 
         if sample['scene_token'] in train_scenes:
             train_nusc_infos.append(info)
         else:
             val_nusc_infos.append(info)
+
+    fig = plt.figure()
+    plt.hist(risks, bins=100)
+    plt.xlabel('Risk Value')
+    plt.ylabel('Frequency')
+    plt.title('Risk Distribution')
+    os.makedirs('image/risk_vis', exist_ok=True)
+    if test:
+        plt.savefig(f'image/risk_vis/test_risks.png')
+    else:
+        plt.savefig(f'image/risk_vis/train_val_risks.png')
+    plt.close(fig)
+    print(f'Max risk value: {max(risks):.4f}, Min risk value: {min(risks):.4f}, Mean risk value: {np.mean(risks):.4f}, Median risk value: {np.median(risks):.4f}')
 
     return train_nusc_infos, val_nusc_infos
 

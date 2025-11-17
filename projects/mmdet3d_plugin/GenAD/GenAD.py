@@ -128,7 +128,8 @@ class GenAD(MVXTwoStageDetector):
                           ego_fut_cmd=None,
                           ego_lcf_feat=None,
                           gt_attr_labels=None,
-                          description_feats=None
+                          description_feats=None,
+                          risk_value=None
                           ):
         """Forward function'
         Args:
@@ -151,7 +152,8 @@ class GenAD(MVXTwoStageDetector):
             ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat,
             gt_labels_3d=gt_labels_3d, gt_attr_labels=gt_attr_labels,
             ego_fut_trajs=ego_fut_trajs, ego_fut_cmd=ego_fut_cmd,
-            description_feats=description_feats
+            description_feats=description_feats,
+            risk_value=risk_value
         )
 
         # 计算loss
@@ -161,7 +163,8 @@ class GenAD(MVXTwoStageDetector):
         ]
         losses = self.pts_bbox_head.loss(
             *loss_inputs,
-            img_metas=img_metas
+            risk_value=risk_value,
+            img_metas=img_metas,
         )
         return losses
 
@@ -309,7 +312,8 @@ class GenAD(MVXTwoStageDetector):
             ego_his_trajs=ego_his_trajs, ego_fut_trajs=ego_fut_trajs,
             ego_fut_masks=ego_fut_masks, ego_fut_cmd=ego_fut_cmd,
             ego_lcf_feat=ego_lcf_feat, gt_attr_labels=gt_attr_labels,
-            description_feats=description_feats
+            description_feats=description_feats,
+            risk_value=kwargs.get('risk_value', None)
         )
 
         losses.update(losses_pts)
@@ -389,6 +393,7 @@ class GenAD(MVXTwoStageDetector):
         ego_fut_cmd=None,
         ego_lcf_feat=None,
         gt_attr_labels=None,
+        risk_value=None,
         **kwargs
     ):
         """Test function without augmentaiton."""
@@ -424,7 +429,8 @@ class GenAD(MVXTwoStageDetector):
             ego_fut_cmd=ego_fut_cmd,
             ego_lcf_feat=ego_lcf_feat,
             gt_attr_labels=gt_attr_labels,
-            description_feats=description_feats
+            description_feats=description_feats,
+            risk_value=flatten_data_from_list(risk_value)
         )
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
@@ -447,7 +453,8 @@ class GenAD(MVXTwoStageDetector):
         ego_fut_cmd=None,
         ego_lcf_feat=None,
         gt_attr_labels=None,
-        description_feats=None
+        description_feats=None,
+        risk_value=None
     ):
         """Test function"""
         mapped_class_names = [
@@ -460,7 +467,7 @@ class GenAD(MVXTwoStageDetector):
         outs = self.pts_bbox_head(
             x, img_metas, prev_bev=prev_bev,
             ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat,ego_fut_cmd=ego_fut_cmd,
-            description_feats=description_feats
+            description_feats=description_feats, risk_value=risk_value
         )
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=rescale)
 
@@ -491,20 +498,24 @@ class GenAD(MVXTwoStageDetector):
             bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]
             bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]
 
-            matched_bbox_result = self.assign_pred_to_gt_vip3d(
-                bbox_result, gt_bbox, gt_label)
-
-            metric_dict = self.compute_motion_metric_vip3d(
-                gt_bbox, gt_label, gt_attr_label, bbox_result,
-                matched_bbox_result, mapped_class_names)
-
-            # ego planning metric
+            # 提取ego的运动
             assert ego_fut_trajs.shape[0] == 1, 'only support batch_size=1 for testing'
             ego_fut_preds = bbox_result['ego_fut_preds']
             ego_fut_trajs = ego_fut_trajs[0, 0]
             ego_fut_cmd = ego_fut_cmd[0, 0, 0]
             ego_fut_cmd_idx = torch.nonzero(ego_fut_cmd)[0, 0]
             ego_fut_pred = ego_fut_preds[ego_fut_cmd_idx]
+
+            matched_bbox_result = self.assign_pred_to_gt_vip3d(
+                bbox_result, gt_bbox, gt_label)
+
+            metric_dict = self.compute_motion_metric_vip3d(
+                gt_bbox, gt_label, gt_attr_label, bbox_result,
+                matched_bbox_result, mapped_class_names,
+                ego_fut_pred, risk_value)
+
+            # ego planning metric
+            # 通过cmd，选择对应cmd的轨迹进行评估
             ego_fut_pred = ego_fut_pred.cumsum(dim=-2)
             ego_fut_trajs = ego_fut_trajs.cumsum(dim=-2)
 
@@ -597,6 +608,8 @@ class GenAD(MVXTwoStageDetector):
             pred_bbox: object,
             matched_bbox_result: object,
             mapped_class_names: object,
+            ego_fut_pred,
+            risk_value,
             match_dis_thresh: object = 2.0,
     ) -> object:
         """Compute EPA metric for one sample.
@@ -639,6 +652,7 @@ class GenAD(MVXTwoStageDetector):
             if i not in matched_bbox_result:
                 metric_dict['fp_'+box_name] += 1
 
+        metric_dict['risk_value_l1'] = 0
         for i in range(gt_label.shape[0]):
             gt_label[i] = 0 if gt_label[i] in veh_list else gt_label[i]
             box_name = mapped_class_names[gt_label[i]]
@@ -655,6 +669,17 @@ class GenAD(MVXTwoStageDetector):
                 gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
                 pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
                 pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
+
+                _risk = 0
+                for agent_fut_pred in pred_fut_trajs:
+                    for j in range(num_valid_ts):
+                        ego_dxy, agent_dxy = ego_fut_pred[j], agent_fut_pred[j]
+                        agent_pose = pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
+                        agent_name = box_name
+                        distance = torch.linalg.norm(torch.cumsum(agent_fut_pred[:(j+1)], axis=-2) + agent_pose - ego_dxy)
+                        _risk += self.pts_bbox_head.loss_plan_risk.compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance)
+                metric_dict['risk_value_l1'] = torch.abs(_risk - risk_value).item()
+
                 gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
                 pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)
                 gt_fut_trajs = gt_fut_trajs + gt_bbox[i].center[0, :2]

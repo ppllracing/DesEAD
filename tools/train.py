@@ -151,19 +151,19 @@ def main():
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
         # update configs according to CLI args if args.work_dir is not None
-        if cfg.use_description:
-            # folder_name = '_with_description_ca'
-            folder_name = 'with_description_ca'
-            if cfg.description_ca_bev:
-                folder_name += '_bev'
-            if cfg.description_ca_map:
-                folder_name += '_map'
-            if cfg.description_ca_motion:
-                folder_name += '_motion'
-            work_dir = osp.join(args.work_dir, folder_name)
-        else:
-            work_dir = osp.join(args.work_dir, 'without_description')
-        cfg.work_dir = work_dir
+        # if cfg.use_description:
+        #     # folder_name = '_with_description_ca'
+        #     folder_name = 'with_description_ca'
+        #     if cfg.description_ca_bev:
+        #         folder_name += '_bev'
+        #     if cfg.description_ca_map:
+        #         folder_name += '_map'
+        #     if cfg.description_ca_motion:
+        #         folder_name += '_motion'
+        #     work_dir = osp.join(args.work_dir, folder_name)
+        # else:
+        #     work_dir = osp.join(args.work_dir, 'without_description')
+        cfg.work_dir = args.work_dir
     elif cfg.get('work_dir', None) is None:
         # use config filename as default work_dir if cfg.work_dir is None
         cfg.work_dir = osp.join('./work_dirs',osp.splitext(osp.basename(args.config))[0])

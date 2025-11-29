@@ -10,6 +10,7 @@ from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.GenAD.planner.metric_stp3 import PlanningMetric
+from projects.mmdet3d_plugin.GenAD.utils.plan_loss import cal_risk
 
 from .Description_head import DescriptionHead
 
@@ -514,6 +515,28 @@ class GenAD(MVXTwoStageDetector):
                 matched_bbox_result, mapped_class_names,
                 ego_fut_pred, risk_value)
 
+            all_cls_scores = outs['all_cls_scores']
+            all_bbox_preds = outs['all_bbox_preds']
+            all_traj_preds = outs['all_traj_preds']
+            all_traj_cls_scores = outs['all_traj_cls_scores']
+            ego_fut_preds = outs['ego_fut_preds']
+            batch, num_agent = all_traj_preds[-1].shape[:2]
+            agent_preds = all_bbox_preds[-1][..., 0:2]
+            agent_fut_preds = all_traj_preds[-1].view(batch, num_agent, self.fut_mode, self.fut_ts, 2)
+            agent_score_preds = all_cls_scores[-1].sigmoid()
+            agent_fut_cls_preds = all_traj_cls_scores[-1].view(batch, num_agent, self.fut_mode).sigmoid()
+            metric_dict['risk_value_l1'] = self.pts_bbox_head.loss_plan_risk(
+                ego_fut_preds[ego_fut_cmd[None, ...] == 1],
+                agent_preds,
+                agent_fut_preds,
+                agent_score_preds,
+                agent_fut_cls_preds,
+                risk_value,
+                loss_weight = 1.0,
+                record_risk = True
+            )
+            metric_dict['risk_value'] = self.pts_bbox_head.loss_plan_risk._risk.item()
+
             # ego planning metric
             # 通过cmd，选择对应cmd的轨迹进行评估
             ego_fut_pred = ego_fut_pred.cumsum(dim=-2)
@@ -636,9 +659,6 @@ class GenAD(MVXTwoStageDetector):
             for cls in motion_cls_names:
                 metric_dict[met+'_'+cls] = 0.0
 
-
-
-
         # ignore_list = ['construction_vehicle', 'barrier',
         #                'traffic_cone', 'motorcycle', 'bicycle']
         veh_list = [0, 1, 2, 3, 4, 6, 7]
@@ -652,7 +672,24 @@ class GenAD(MVXTwoStageDetector):
             if i not in matched_bbox_result:
                 metric_dict['fp_'+box_name] += 1
 
-        metric_dict['risk_value_l1'] = 0
+        # metric_dict['risk_value'] = 0
+        # metric_dict['risk_value_l1'] = 0
+        # for i, pred_fut_trajs in enumerate(pred_bbox['trajs_3d']):
+        #     pred_box = pred_bbox['boxes_3d'][i]
+        #     pred_fut_trajs = pred_fut_trajs.reshape(self.fut_mode, self.fut_ts, 2)
+        #     _risk = []
+        #     for agent_fut_pred in pred_fut_trajs:
+        #         for j in range(agent_fut_pred.shape[0]):
+        #             ego_dxy, agent_dxy = ego_fut_pred[j], agent_fut_pred[j]
+        #             agent_pose = pred_box.center[0, :2]
+        #             agent_name = box_name
+        #             distance = torch.linalg.norm(torch.cumsum(agent_fut_pred[:(j+1)], axis=-2) + agent_pose - ego_dxy)
+        #             _risk.append(
+        #                 self.pts_bbox_head.loss_plan_risk.compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance)
+        #             )
+        #     metric_dict['risk_value'] += max(_risk).item()
+        # metric_dict['risk_value_l1'] = abs(metric_dict['risk_value'] - risk_value.item())
+
         for i in range(gt_label.shape[0]):
             gt_label[i] = 0 if gt_label[i] in veh_list else gt_label[i]
             box_name = mapped_class_names[gt_label[i]]
@@ -669,16 +706,6 @@ class GenAD(MVXTwoStageDetector):
                 gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
                 pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
                 pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
-
-                _risk = 0
-                for agent_fut_pred in pred_fut_trajs:
-                    for j in range(num_valid_ts):
-                        ego_dxy, agent_dxy = ego_fut_pred[j], agent_fut_pred[j]
-                        agent_pose = pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
-                        agent_name = box_name
-                        distance = torch.linalg.norm(torch.cumsum(agent_fut_pred[:(j+1)], axis=-2) + agent_pose - ego_dxy)
-                        _risk += self.pts_bbox_head.loss_plan_risk.compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance)
-                metric_dict['risk_value_l1'] = torch.abs(_risk - risk_value).item()
 
                 gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
                 pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)

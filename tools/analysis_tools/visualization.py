@@ -1,4 +1,4 @@
-import time
+import math
 import sys
 sys.path.append('')
 import os
@@ -7,6 +7,7 @@ import os.path as osp
 from PIL import Image
 from tqdm import tqdm
 from typing import List, Dict
+from itertools import product
 
 import cv2
 import mmcv
@@ -35,6 +36,37 @@ cams = ['CAM_FRONT',
  'CAM_BACK',
  'CAM_BACK_LEFT',
  'CAM_FRONT_LEFT']
+
+# 他车的质量相对于自车的倍数
+MASS = {
+    'barrier': 2.5,
+    'bicycle': 0.5,
+    'bus': 2.0,
+    'car': 1.0,
+    'construction_vehicle': 1.0,
+    'motorcycle': 1.0,
+    'pedestrian': 0.5,
+    'traffic_cone': 0.0,
+    'trailer': 2.5,
+    'truck': 2.5
+}
+# 他车的危险系数
+Risk_K = {
+    'barrier': 2.5,
+    'bicycle': 0.5,
+    'bus': 2.0,
+    'car': 1.0,
+    'construction_vehicle': 1.0,
+    'motorcycle': 1.0,
+    'pedestrian': 0.5,
+    'traffic_cone': 0.0,
+    'trailer': 2.5,
+    'truck': 2.5
+}
+# 环境因素
+Risk_C = 1.0
+# 横向衰减系数
+Risk_beta = 0.5
 
 
 def render_annotation(
@@ -538,6 +570,9 @@ def visualize_sample(nusc: NuScenes,
     for box_est, box_est_global in zip(boxes_est, boxes_est_global):
         box_est.score = box_est_global.detection_score
 
+    # 模态筛选
+    mode_idxs, cur_risk = select_modes(pred_data, sample_token, boxes_est, conf_th)
+
     xlim = [-30, 30]
     ylim = [-30, 30]
 
@@ -551,33 +586,212 @@ def visualize_sample(nusc: NuScenes,
     draw_map(fig, result_dic, axes, colors_plt)
 
     # Show Agents
-    draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset)
+    draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset, mode_idxs)
 
     # Show Planning
-    draw_plnning(fig, pred_data, sample_token, axes)
-    for data in pred_data['generalization']:
-        draw_plnning(fig, data, sample_token, axes)
+    draw_plnning(fig, pred_data, sample_token, axes, cur_risk)
     plt.savefig(osp.join(savepath, 'samples', f'bev_pred_{file_id}.png'), bbox_inches='tight', dpi=200)
     title = savepath.split('/')[-1]
     plt.title(title)
-    plt.savefig(savepath+'/bev_pred.png', bbox_inches='tight', dpi=200)
-    plt.close()
+    for i in range(100):
+        if not osp.exists(osp.join(savepath, f'bev_pred_{i}.png')):
+            plt.savefig(osp.join(savepath, f'bev_pred_{i}.png'), bbox_inches='tight', dpi=200)
+            plt.close()
+            break
 
-    fig_, axes = plt.subplots(1, 1, figsize=(4, 4))
-    plt.xlim(*xlim)
-    plt.ylim(*ylim)
-    result_dic = pred_data['map_results'][sample_token]['vectors']
-    draw_map(fig, result_dic, axes, colors_plt)
-    plt.savefig(osp.join(savepath, 'samples', f'bev_pred_map_{file_id}.png'), bbox_inches='tight', dpi=200)
-    plt.close()
+    # fig_, axes = plt.subplots(1, 1, figsize=(4, 4))
+    # plt.xlim(*xlim)
+    # plt.ylim(*ylim)
+    # result_dic = pred_data['map_results'][sample_token]['vectors']
+    # draw_map(fig, result_dic, axes, colors_plt)
+    # plt.savefig(osp.join(savepath, 'samples', f'bev_pred_map_{file_id}.png'), bbox_inches='tight', dpi=200)
+    # plt.close()
 
-    fig_, axes = plt.subplots(1, 1, figsize=(4, 4))
-    plt.xlim(*xlim)
-    plt.ylim(*ylim)
-    draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset)
-    draw_plnning(fig, pred_data, sample_token, axes)
-    plt.savefig(osp.join(savepath, 'samples', f'bev_pred_agents_{file_id}.png'), bbox_inches='tight', dpi=200)
-    plt.close()
+    # fig_, axes = plt.subplots(1, 1, figsize=(4, 4))
+    # plt.xlim(*xlim)
+    # plt.ylim(*ylim)
+    # draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset)
+    # draw_plnning(fig, pred_data, sample_token, axes)
+    # plt.savefig(osp.join(savepath, 'samples', f'bev_pred_agents_{file_id}.png'), bbox_inches='tight', dpi=200)
+    # plt.close()
+
+def compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance):
+    m = MASS.get(agent_name, 2.0)
+    k = Risk_K.get(agent_name, 2.0)
+    c = Risk_C
+    beta = Risk_beta
+
+    # 位移变化替代速度
+    ego_v = np.linalg.norm(ego_dxy)
+    agent_v = np.linalg.norm(agent_dxy)
+
+    # 计算运动角度
+    cos_theta = np.dot(ego_dxy, agent_dxy) / (np.linalg.norm(ego_dxy) * np.linalg.norm(agent_dxy) + 1e-8)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = math.acos(cos_theta)
+
+    # 计算系数
+    v = 60 / 3.6  # 60 km/h，论文中没有说波速如何定义，此处用城市道路通常速度代替
+    alpha_lon = max(0, (v + ego_v * math.cos(theta)) / (v - agent_v * math.cos(theta)))
+    alpha_lat = math.exp(-beta * (math.sin(theta) ** 2))
+
+    e = 0.5 * k * c * m * (ego_v - agent_v) ** 2 / distance
+    e = alpha_lon * alpha_lat * e
+    # return math.log(e + 1 + 1e-6)
+    return e
+
+def select_modes(pred_data, sample_token, boxes_est, conf_th) -> List[int]:
+    n_agent, n_mode, n_fut = len(boxes_est), 6, 6
+    risk_values_matrix = []
+
+    # 获取模型输入的风险值
+    risk_value_inp = pred_data['inputs'][sample_token]['risk_value'][0].data[0].item()
+    # 获取自车和他车的运动轨迹
+    # ignore_list = ['barrier', 'bicycle', 'traffic_cone', 'pedestrian']
+    ignore_list = []
+    plan_cmd = np.argmax(pred_data['plan_results'][sample_token][1][0,0,0])
+    ego_trajs = pred_data['plan_results'][sample_token][0][plan_cmd].cumsum(axis=0).numpy()
+    for box in boxes_est:
+        if box.name in ignore_list:
+            continue
+        # Show only predictions with a high score.
+        assert not np.isnan(box.score), 'Error: Box score cannot be NaN!'
+        if box.score < conf_th or abs(box.center[0]) > 15 or abs(box.center[1]) > 30:
+            continue
+
+        risk_values_matrix.append(np.zeros(n_mode))
+        agent_name = box.name
+        assert agent_name in MASS.keys(), f'Error: agent_name {agent_name} is not supported!'
+        agent_pose = box.center[:2]
+        agent_trajs = box.fut_trajs.reshape(-1, 6, 2)
+        for mode_idx in range(n_mode):
+            for fut_idx in range(n_fut):
+                ego_dxy, agent_dxy = ego_trajs[fut_idx, :2], agent_trajs[mode_idx, fut_idx]
+                distance = np.linalg.norm(np.cumsum(agent_trajs[mode_idx, :(fut_idx+1)], axis=-2) + agent_pose - ego_dxy)
+                risk_values_matrix[-1][mode_idx] += compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance)
+    risk_values_matrix = np.stack(risk_values_matrix, axis=0)
+
+    if len(risk_values_matrix) <= 8:
+        best_choice, best_diff, cur_risk = optimize_vectorized(risk_values_matrix, risk_value_inp)
+    else:
+        best_choice, best_diff, cur_risk = optimize_greedy(risk_values_matrix, risk_value_inp)
+        # best_choice, best_diff, cur_risk = optimize_with_branch_bound(risk_values_matrix, risk_value_inp)
+
+    return best_choice, cur_risk
+
+def optimize_vectorized(risk_values_matrix, risk_value_inp):
+    """
+    向量化计算所有组合的风险值
+    """
+    n_agent, n_mode = risk_values_matrix.shape[:2]
+
+    # 生成所有可能的组合
+    all_combinations = np.array(list(product(range(n_mode), repeat=n_agent)))
+    
+    # 向量化计算风险值
+    risk_values = risk_values_matrix[np.arange(n_agent), all_combinations].sum(axis=1)
+    
+    # 找到最接近目标的风险值
+    diffs = np.abs(risk_values - risk_value_inp)
+    best_idx = np.argmin(diffs)
+    
+    return tuple(all_combinations[best_idx]), diffs[best_idx], risk_values[best_idx]
+
+import heapq
+
+def optimize_with_branch_bound(risk_values_matrix, risk_value_inp):
+    """
+    使用分支限界法优化搜索过程
+    """
+    n_agent, n_mode = risk_values_matrix.shape[:2]
+    best_diff = float('inf')
+    best_choice = None
+    cur_risk = 0.0
+    
+    # 优先队列：存储 (当前差异估计, 当前风险值, 已选择的模式, 当前代理索引)
+    heap = [(0.0, 0.0, [], 0)]
+    
+    while heap:
+        est_diff, current_risk, current_choice, agent_idx = heapq.heappop(heap)
+        
+        # 如果估计差异已经大于当前最优，剪枝
+        if est_diff >= best_diff:
+            continue
+            
+        if agent_idx == n_agent:
+            # 完整路径
+            diff = abs(current_risk - risk_value_inp)
+            if diff < best_diff:
+                best_diff = diff
+                best_choice = tuple(current_choice)
+                cur_risk = current_risk
+            continue
+        
+        # 为当前代理尝试所有模式
+        for mode in range(n_mode):
+            new_risk = current_risk + risk_values_matrix[agent_idx, mode]
+            
+            # 计算最小可能差异（假设后续代理都选择最小/最大风险值）
+            remaining_agents = n_agent - agent_idx - 1
+            min_remaining = risk_values_matrix[agent_idx+1:].min(axis=1).sum() if remaining_agents > 0 else 0
+            max_remaining = risk_values_matrix[agent_idx+1:].max(axis=1).sum() if remaining_agents > 0 else 0
+            
+            min_possible_diff = abs(new_risk + min_remaining - risk_value_inp)
+            max_possible_diff = abs(new_risk + max_remaining - risk_value_inp)
+            est_diff = min(min_possible_diff, max_possible_diff)
+            
+            if est_diff < best_diff:
+                heapq.heappush(heap, (est_diff, new_risk, current_choice + [mode], agent_idx + 1))
+    
+    return best_choice, best_diff, cur_risk
+
+def optimize_greedy(risk_values_matrix, risk_value_inp):
+    """
+    贪心策略快速找到近似最优解
+    """
+    n_agent, n_mode = risk_values_matrix.shape[:2]
+    # 初始贪心选择
+    choice = []
+    current_risk = 0.0
+    
+    for i in range(n_agent):
+        # 选择使当前风险最接近目标的代理模式
+        best_mode = 0
+        best_diff = float('inf')
+        
+        for mode in range(n_mode):
+            temp_risk = current_risk + risk_values_matrix[i, mode]
+            diff = abs(temp_risk - risk_value_inp)
+            if diff < best_diff:
+                best_diff = diff
+                best_mode = mode
+        
+        choice.append(best_mode)
+        current_risk += risk_values_matrix[i, best_mode]
+    
+    # 局部搜索优化
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n_agent):
+            original_mode = choice[i]
+            original_risk = risk_values_matrix[i, original_mode]
+            
+            for new_mode in range(n_mode):
+                if new_mode == original_mode:
+                    continue
+                    
+                new_risk = current_risk - original_risk + risk_values_matrix[i, new_mode]
+                new_diff = abs(new_risk - risk_value_inp)
+                old_diff = abs(current_risk - risk_value_inp)
+                
+                if new_diff < old_diff:
+                    choice[i] = new_mode
+                    current_risk = new_risk
+                    improved = True
+                    break
+    
+    return tuple(choice), abs(current_risk - risk_value_inp), current_risk
 
 def draw_map(fig, result_dic, axes, colors_plt):
     for vector in result_dic:
@@ -596,24 +810,27 @@ def draw_map(fig, result_dic, axes, colors_plt):
     fig.set_tight_layout(True)
     fig.canvas.draw()
 
-def draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset):
+def draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset, mode_idxs=None):
     # ignore_list = ['barrier', 'motorcycle', 'bicycle', 'traffic_cone']
-    ignore_list = ['barrier', 'bicycle', 'traffic_cone']
+    # ignore_list = ['barrier', 'bicycle', 'traffic_cone', 'pedestrian']
+    ignore_list = []
 
     # Show Pred boxes.
     color_list = ['salmon', 'darkcyan', 'orange', 'red', 'lightcoral', 'deepskyblue', 'gold', 'seagreen', 'deeppink',
                  'dodgerblue', 'royalblue', 'yellow', 'violet', 'peru', 'palegreen', 'slateblue']
     # color_list = ['Blues', 'PiYG']
 
+    idx = -1
     for i, box in enumerate(boxes_est):
         if box.name in ignore_list:
             continue
         # Show only predictions with a high score.
         assert not np.isnan(box.score), 'Error: Box score cannot be NaN!'
-        if box.name in ['pedestrian']:
-            continue
+
         if box.score < conf_th or abs(box.center[0]) > 15 or abs(box.center[1]) > 30:
             continue
+
+        idx += 1
 
         # colors = color_map(, cmap)
         if i < 16:
@@ -625,8 +842,8 @@ def draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset):
         box.render(axes, view=np.eye(4), colors=(color_box, color_box, color_box), linewidth=3, box_idx=None)
 
         if traj_use_perstep_offset:
-                # mode_idx = [0, 1, 2, 3, 4, 5]
-            mode_idx = [0]
+            # mode_idx = [0, 1, 2, 3, 4, 5]
+            mode_idx = [0] if mode_idxs is None else [mode_idxs[idx]]
             # box.render_fut_trajs_grad_color(axes, linewidth=4, mode_idx=mode_idx, fut_ts=6, cmap='autumn')
             box.render_fut_trajs_grad_color(axes, linewidth=6, mode_idx=mode_idx, fut_ts=3, cmap="autumn")
         #cmap = LinearSegmentedColormap.from_list("mycmap", color_box)
@@ -643,7 +860,7 @@ def draw_agents(fig, boxes_est, axes, conf_th, traj_use_perstep_offset):
     fig.set_tight_layout(True)
     fig.canvas.draw()
 
-def draw_plnning(fig, pred_data, sample_token, axes):
+def draw_plnning(fig, pred_data, sample_token, axes, cur_risk):
     # Show Planning.
     axes.plot([-0.9, -0.9], [-2, 2], color='mediumseagreen', linewidth=3, alpha=0.8)
     axes.plot([-0.9, 0.9], [2, 2], color='mediumseagreen', linewidth=3, alpha=0.8)
@@ -656,10 +873,11 @@ def draw_plnning(fig, pred_data, sample_token, axes):
     plan_traj = plan_traj.cumsum(axis=0)
     plan_traj = np.concatenate((np.zeros((1, plan_traj.shape[1])), plan_traj), axis=0)
     plan_traj = np.stack((plan_traj[:-1], plan_traj[1:]), axis=1)
+    risk_value = pred_data['metrics'][sample_token]['risk_value'] if cur_risk is None else cur_risk
 
     axes.text(
         *plan_traj[-1, -1], 
-        f'{pred_data["metrics"][sample_token]["risk_value"]:.2f}/{pred_data["inputs"][sample_token]["risk_value"][0].data[0].item():.2f}'
+        f'{risk_value:.2f}/{pred_data["inputs"][sample_token]["risk_value"][0].data[0].item():.2f}'
     )
     # print(f'{pred_data["metrics"][sample_token]["risk_value"]:.2f}/{pred_data["inputs"][sample_token]["risk_value"][0].data[0].item():.2f}')
 
@@ -801,7 +1019,26 @@ def render_sample_data(
         out_name=out_name, traj_use_perstep_offset=traj_use_perstep_offset,
         file_id=file_id
     )
-
+    for data in pred_data['generalization']:
+        lidiar_render(
+            sample_toekn, data, out_path=out_path,
+            out_name=out_name, traj_use_perstep_offset=traj_use_perstep_offset,
+            file_id=file_id
+        )
+    
+    image_paths = [osp.join(out_path, f'bev_pred_{i}.png') for i in range(len(pred_data['generalization'])+1)]
+    images = [Image.open(image_path) for image_path in image_paths]
+    widths, heights = zip(*(i.size for i in images))
+    total_width = sum(widths)
+    max_height = max(heights)
+    new_image = Image.new('RGBA', (total_width, max_height))
+    x_offset = 0
+    for img, img_path in zip(images, image_paths):
+        new_image.paste(img, (x_offset, 0))
+        x_offset += img.size[0]
+        os.remove(img_path)
+    # 保存新图像
+    new_image.save(osp.join(out_path, f'bev_pred.png'))
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Visualize VAD predictions')
@@ -993,7 +1230,7 @@ def run(sample_token_list, results, out_path, video_name):
         vis_img = cv2.hconcat([cam_img, sample_img])
 
         cv2.imwrite(osp.join(out_path, f'{file_id}.png'), vis_img)
-        # video.write(vis_img)
+        video.write(vis_img)
 
     # # 等待视频生成完毕
     # while True:

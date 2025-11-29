@@ -2090,6 +2090,7 @@ class GenADHead(DETRHead):
         # 计算未来的分布
         future_mu, future_log_sigma = None, None
         if future_distribution_inputs is not None:
+            assert self.training, "future_distribution_inputs should be None in eval mode"
             # 训练阶段
             # Concatenate future labels to z_t
             # future_features = future_distribution_inputs[:, 1:].contiguous().view(b, 1, -1, h, w)
@@ -2097,6 +2098,9 @@ class GenADHead(DETRHead):
                 present_features,  # [1, 1801, 512]
                 future_distribution_inputs  # [1, 1801, 12]
             ], dim=2)
+            # 随机封闭risk_value
+            if torch.rand(1) < 0.1:
+                risk_value = torch.ones_like(risk_value) * -1.0
             future_mu, future_log_sigma = self.future_distribution(
                 risk_value,  # [1, 1, 1]
                 future_features  # [1, 1801, 524]

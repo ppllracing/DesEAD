@@ -522,6 +522,8 @@ class PlanRiskLoss(nn.Module):
         self.y_dis_thresh = y_dis_thresh
         self.pc_range = point_cloud_range
 
+        self._risk = None
+
     def forward(self,
                 ego_fut_preds,
                 agent_preds,
@@ -530,6 +532,8 @@ class PlanRiskLoss(nn.Module):
                 agent_fut_cls_preds,
                 ego_risk_ref,
                 reduction_override=None,
+                loss_weight = None,
+                record_risk=False
                 ):
         """Forward function.
 
@@ -567,7 +571,7 @@ class PlanRiskLoss(nn.Module):
         agent_fut_preds = agent_fut_preds[batch_idxs, agent_num_idxs, best_mode_idxs]
         agent_fut_preds = agent_fut_preds[None, available_mask]
 
-        loss_bbox = self.loss_weight * plan_risk_loss(
+        loss = (loss_weight or self.loss_weight) * plan_risk_loss(
             ego_fut_preds,
             agent_preds,
             agent_fut_preds=agent_fut_preds,
@@ -575,7 +579,15 @@ class PlanRiskLoss(nn.Module):
             ego_risk_ref=ego_risk_ref,
             reduction=reduction
         )
-        return loss_bbox
+
+        if record_risk:
+            self._risk = cal_risk(
+                ego_fut_preds,
+                agent_preds,
+                agent_fut_preds=agent_fut_preds,
+                agent_names=agent_max_score_idxs
+            )
+        return loss
 
     @staticmethod
     def compute_point_risk_value(ego_dxy, agent_dxy, agent_name, distance):
@@ -628,8 +640,19 @@ def plan_risk_loss(
         agent_names (Tensor): [B, num_agent]
         ego_risk_ref (Tensor): [B, 1]
     Returns:
-        torch.Tensor: Calculated loss [B, fut_mode, fut_ts, 2]
+        torch.Tensor: Calculated loss [B, 1]
     """
+    risk_pred = cal_risk(ego_fut_preds, agent_preds, agent_fut_preds, agent_names)
+    loss = F.l1_loss(risk_pred, ego_risk_ref, reduction='none').clamp(0, 100)
+    assert not torch.isnan(loss).any()
+    return loss
+
+def cal_risk(
+    ego_fut_preds,
+    agent_preds,
+    agent_fut_preds,
+    agent_names
+):
     B, num_agent, fut_ts = agent_fut_preds.shape[:3]
 
     risk_values = torch.zeros([B, num_agent, fut_ts], device=ego_fut_preds.device)
@@ -643,6 +666,4 @@ def plan_risk_loss(
                 risk_values[i, j, k] = compute(ego_dxy, agent_dxy, agent_name, distance)
     risk_pred = torch.sum(risk_values, dim=(1, 2), keepdims=True)
     risk_pred = torch.log(risk_pred + 1 + 1e-6)
-    loss = F.l1_loss(risk_pred, ego_risk_ref, reduction='none').clamp(0, 100)
-    assert not torch.isnan(loss).any()
-    return loss
+    return risk_pred

@@ -236,7 +236,8 @@ def main():
     if not distributed:
         # assert False
         model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        with torch.no_grad():
+            outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
         assert False
         model = MMDistributedDataParallel(
